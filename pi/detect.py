@@ -195,6 +195,9 @@ def main():
     ap.add_argument("--no-preview", action="store_true")
     ap.add_argument("--show-mask", action="store_true",
                     help="show combined detection mask alongside frame")
+    ap.add_argument("--debug", action="store_true",
+                    help="print detection stats and rejection reasons every 2s. "
+                         "essential when running headless (no cv2.imshow).")
     args = ap.parse_args()
 
     cap = open_camera(args.source, args.width, args.height)
@@ -237,6 +240,12 @@ def main():
     fps_count = 0
     fps = 0.0
     pkt_count = 0
+
+    from collections import Counter
+    debug_t0 = time.monotonic()
+    debug_reject_reasons = Counter()
+    debug_target_hits = 0
+    debug_frame_count = 0
 
     # OpenCV on QNX is built without GUI support (no GTK / Cocoa).
     # Try imshow once with a 1x1 frame; if it throws, run headless.
@@ -484,6 +493,28 @@ def main():
             fps = fps_count / (ts - fps_t0)
             fps_count = 0
             fps_t0 = ts
+
+        # --- headless debug stats ---
+        if args.debug:
+            debug_frame_count += 1
+            if detected:
+                debug_target_hits += 1
+            for _c, _a, reason in rejected:
+                # Group by first word so "solid>0.72" collapses to "solid>".
+                key = reason.split()[0] if reason else "unknown"
+                debug_reject_reasons[key] += 1
+            if ts - debug_t0 >= 2.0:
+                total_rej = sum(debug_reject_reasons.values())
+                top = ", ".join(
+                    f"{k}={v}" for k, v in debug_reject_reasons.most_common(6))
+                import sys
+                print(f"[detect] frames={debug_frame_count} "
+                      f"targets={debug_target_hits} rej={total_rej}  {top}",
+                      file=sys.stderr, flush=True)
+                debug_frame_count = 0
+                debug_target_hits = 0
+                debug_reject_reasons.clear()
+                debug_t0 = ts
 
         if not args.no_preview and not gui_disabled:
             # Draw rejected blobs in yellow with the reason so we can tune.
