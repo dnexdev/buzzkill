@@ -31,15 +31,97 @@ def parse_hostport(s: str):
     return host, int(port)
 
 
+class CamsrcCapture:
+    """Reads BGR frames from the camsrc subprocess (QNX camapi bridge).
+
+    camsrc writes: 16-byte header ("CSRC" + u32 w + u32 h + u32 bpp)
+    then repeatedly: w*h*bpp bytes of raw BGR.
+    """
+    def __init__(self, cmd):
+        import subprocess, struct
+        self._struct = struct
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+        )
+        header = self._read_exact(16)
+        if header is None:
+            err = self._proc.stderr.read().decode("utf-8", errors="replace")
+            raise SystemExit(f"camsrc died before header:\n{err}")
+        magic = header[:4]
+        if magic != b"CSRC":
+            raise SystemExit(f"camsrc bad magic: {magic!r}")
+        self.width, self.height, self.bpp = struct.unpack("<III", header[4:16])
+        self._frame_size = self.width * self.height * self.bpp
+        if self.bpp != 3:
+            raise SystemExit(f"camsrc bpp {self.bpp} != 3, cannot use")
+        # Drain stderr in a background thread so the pipe doesn't fill and stall.
+        import threading
+        def _drain():
+            for line in self._proc.stderr:
+                pass
+        threading.Thread(target=_drain, daemon=True).start()
+
+    def _read_exact(self, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self._proc.stdout.read(n - len(buf))
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def isOpened(self):
+        return self._proc.poll() is None
+
+    def read(self):
+        raw = self._read_exact(self._frame_size)
+        if raw is None:
+            return False, None
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape(
+            (self.height, self.width, 3))
+        return True, arr
+
+    def set(self, *_):
+        # No-op: dimensions are fixed by camsrc.
+        return False
+
+    def release(self):
+        try:
+            self._proc.terminate()
+            self._proc.wait(timeout=1.0)
+        except Exception:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+
+
 def open_camera(source, width, height):
-    src = int(source) if str(source).isdigit() else source
-    cap = cv2.VideoCapture(src)
+    # Special source: launch our QNX camapi bridge and read raw BGR from its stdout.
+    if str(source) == "camsrc":
+        import os
+        exe = os.path.join(os.path.dirname(__file__), "camsrc", "camsrc")
+        if not os.path.exists(exe):
+            raise SystemExit(
+                f"camsrc binary not found at {exe}. "
+                "build with:  make -C pi/camsrc")
+        cap = CamsrcCapture([exe, "--w", str(width), "--h", str(height)])
+        return cap
+
+    is_pipeline = isinstance(source, str) and (" " in source or "!" in source)
+    src = int(source) if (not is_pipeline and str(source).isdigit()) else source
+    if is_pipeline:
+        cap = cv2.VideoCapture(src, cv2.CAP_GSTREAMER)
+    else:
+        cap = cv2.VideoCapture(src)
     if not cap.isOpened():
         raise SystemExit(f"cannot open source: {source}")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    # Try to get low latency — some backends honor this, some don't.
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    if not is_pipeline:
+        # These properties only apply to V4L2/webcam. GStreamer pipelines
+        # already encode dimensions in the source string.
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     # Warmup — first frames from CSI cameras are often garbage.
     for _ in range(5):
         cap.read()
