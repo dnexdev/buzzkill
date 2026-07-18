@@ -77,8 +77,10 @@ class CamsrcCapture:
         raw = self._read_exact(self._frame_size)
         if raw is None:
             return False, None
+        # .copy() makes the array writable; frombuffer views are read-only
+        # and OpenCV can't draw on read-only Mats.
         arr = np.frombuffer(raw, dtype=np.uint8).reshape(
-            (self.height, self.width, 3))
+            (self.height, self.width, 3)).copy()
         return True, arr
 
     def set(self, *_):
