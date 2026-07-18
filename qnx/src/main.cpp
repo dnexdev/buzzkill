@@ -92,6 +92,7 @@ int main(int argc, char** argv) {
 
     Tracker tracker;
 
+    // Run aiming and safety decisions at a predictable real-time cadence.
     const double tick_hz = 50.0;
     const double tick_dt = 1.0 / tick_hz;
 
