@@ -1,158 +1,346 @@
-// buzzkill ESP32 firmware — receives ASCII commands over USB serial from QNX
-// and drives the turret: pan/tilt servos, flywheel motors, pusher.
+// Buzzkill turret firmware for an ESP32 DevKit.
 //
-// Protocol (line-delimited, \n terminated):
-//   A <pan> <tilt>   aim, signed degrees, ±90 (0 = center)
-//   S <0|1>          spin flywheels off/on (leaves them running for fast follow-up shots)
-//   F                fire one pusher pulse (assumes wheels are spun up)
-//   D                disarm: center servos, stop wheels, retract pusher
-//   H                heartbeat — resets the watchdog, no side effects
-// Replies:
-//   OK\n on success, ERR <reason>\n otherwise
-//
-// Safety: if no command is received for WATCHDOG_MS the firmware auto-disarms.
-// Wire the flywheel MOSFET gate to FLYWHEEL_PIN. External servo/motor power required.
+// The command interface is intentionally line-oriented so it works from both
+// the Arduino Serial Monitor and a Raspberry Pi/QNX serial process.
+
+// IMPORTANT: Power the servos from a regulated external 5 V supply. Connect
+// the servo supply ground to ESP32 ground. Drive the flywheel through a proper
+// logic-level N-channel MOSFET and flyback protection suitable for the motor.
 
 #include <ESP32Servo.h>
 
-// ---- pin map — change to match your wiring ----
-constexpr int PIN_PAN      = 13;
-constexpr int PIN_TILT     = 12;
-constexpr int PIN_PUSHER   = 14;   // pusher servo (or MOSFET gate for solenoid)
-constexpr int PIN_FLYWHEEL = 27;   // MOSFET gate driving flywheel motors
-constexpr int PIN_LED      = 2;    // onboard LED as status
+// ---------------------------------------------------------------------------
+// Hardware and tuning configuration
+// ---------------------------------------------------------------------------
 
-// ---- servo geometry ----
-constexpr int PAN_CENTER_US   = 1500;
-constexpr int TILT_CENTER_US  = 1500;
-constexpr int US_PER_DEG      = 10;   // ~1000-2000us over ±50°. Calibrate on-site.
-constexpr int PAN_MIN_US      = 800;
-constexpr int PAN_MAX_US      = 2200;
-constexpr int TILT_MIN_US     = 900;
-constexpr int TILT_MAX_US     = 2100;
+constexpr int PAN_PIN = 13;
+constexpr int TILT_PIN = 12;
+constexpr int PUSHER_PIN = 14;
+constexpr int FLYWHEEL_PIN = 27;
 
-constexpr int PUSHER_HOME_US  = 1000;
-constexpr int PUSHER_PUSH_US  = 2000;
-constexpr int PUSHER_PUSH_MS  = 120;   // how long to hold the push
-constexpr int SHOT_COOLDOWN_MS = 250;  // min between pusher pulses
+constexpr int CENTER_PAN = 90;
+constexpr int CENTER_TILT = 90;
 
-constexpr unsigned long WATCHDOG_MS = 500;
+constexpr int PAN_MIN = 30;
+constexpr int PAN_MAX = 150;
+constexpr int TILT_MIN = 45;
+constexpr int TILT_MAX = 135;
 
-Servo pan_servo, tilt_servo, pusher_servo;
+constexpr int PUSHER_FORWARD = 150;
+constexpr int PUSHER_BACK = 30;
 
-bool     flywheels_on   = false;
-unsigned long last_cmd_ms = 0;
-unsigned long last_shot_ms = 0;
+constexpr unsigned long FLYWHEEL_SPINUP_MS = 800;
+constexpr unsigned long PUSHER_FORWARD_MS = 180;
+constexpr unsigned long PUSHER_SETTLE_MS = 180;
 
-void disarm() {
-  pan_servo.writeMicroseconds(PAN_CENTER_US);
-  tilt_servo.writeMicroseconds(TILT_CENTER_US);
-  pusher_servo.writeMicroseconds(PUSHER_HOME_US);
-  digitalWrite(PIN_FLYWHEEL, LOW);
-  flywheels_on = false;
-  digitalWrite(PIN_LED, LOW);
-}
+// Delay in milliseconds between one-degree servo steps. Lower is faster.
+constexpr unsigned long SERVO_SPEED = 12;
 
-int clamp_us(int us, int lo, int hi) {
-  return us < lo ? lo : (us > hi ? hi : us);
-}
+constexpr size_t SERIAL_BUFFER_SIZE = 64;
 
-void do_aim(float pan_deg, float tilt_deg) {
-  int p = PAN_CENTER_US  + (int)(pan_deg  * US_PER_DEG);
-  int t = TILT_CENTER_US + (int)(tilt_deg * US_PER_DEG);
-  pan_servo.writeMicroseconds(clamp_us(p, PAN_MIN_US, PAN_MAX_US));
-  tilt_servo.writeMicroseconds(clamp_us(t, TILT_MIN_US, TILT_MAX_US));
-}
+Servo panServo;
+Servo tiltServo;
+Servo pusherServo;
 
-void do_fire() {
-  unsigned long now = millis();
-  if (now - last_shot_ms < SHOT_COOLDOWN_MS) return;   // silently ignore rapid retriggers
-  if (!flywheels_on) {
-    digitalWrite(PIN_FLYWHEEL, HIGH);   // emergency spinup — but the shot will be weak
-    flywheels_on = true;
-    delay(200);                         // give wheels a moment (ideally the QNX side sent S1 earlier)
-  }
-  pusher_servo.writeMicroseconds(PUSHER_PUSH_US);
-  delay(PUSHER_PUSH_MS);
-  pusher_servo.writeMicroseconds(PUSHER_HOME_US);
-  last_shot_ms = millis();
-}
+int currentPan = CENTER_PAN;
+int currentTilt = CENTER_TILT;
+int targetPan = CENTER_PAN;
+int targetTilt = CENTER_TILT;
 
-void handle_line(char* line) {
-  last_cmd_ms = millis();
-  digitalWrite(PIN_LED, HIGH);
+bool armed = false;
+bool flywheelOn = false;
+unsigned long lastServoStepMs = 0;
 
-  char cmd = line[0];
-  char* rest = line + 1;
-  while (*rest == ' ') ++rest;
+enum class FireState { IDLE, SPINUP, PUSHING, RETRACTING };
+FireState fireState = FireState::IDLE;
+unsigned long fireStateStartedMs = 0;
+bool restoreFlywheelOff = false;
 
-  switch (cmd) {
-    case 'A': {
-      float pan = 0, tilt = 0;
-      if (sscanf(rest, "%f %f", &pan, &tilt) != 2) { Serial.println("ERR aim"); return; }
-      do_aim(pan, tilt);
-      Serial.println("OK");
-      break;
-    }
-    case 'S': {
-      int on = 0;
-      if (sscanf(rest, "%d", &on) != 1) { Serial.println("ERR spin"); return; }
-      flywheels_on = (on != 0);
-      digitalWrite(PIN_FLYWHEEL, flywheels_on ? HIGH : LOW);
-      Serial.println("OK");
-      break;
-    }
-    case 'F': do_fire();  Serial.println("OK"); break;
-    case 'D': disarm();   Serial.println("OK"); break;
-    case 'H': Serial.println("OK"); break;
-    default:  Serial.println("ERR cmd");
-  }
-}
+char serialBuffer[SERIAL_BUFFER_SIZE];
+size_t serialLength = 0;
+bool discardingSerialLine = false;
+
+void handleSerial();
+void movePanTilt(int panOffset, int tiltOffset);
+void updatePanTilt();
+void setFlywheel(bool enabled);
+void fireOnce();
+void updateFiring();
+void cancelFiring();
+void arm();
+void disarm();
+void emergencyStop();
+void printHelp();
+void printAimStatus();
 
 void setup() {
   Serial.begin(115200);
 
-  pinMode(PIN_FLYWHEEL, OUTPUT);
-  pinMode(PIN_LED, OUTPUT);
-  digitalWrite(PIN_FLYWHEEL, LOW);
-  digitalWrite(PIN_LED, LOW);
+  pinMode(FLYWHEEL_PIN, OUTPUT);
+  digitalWrite(FLYWHEEL_PIN, LOW);
 
+  // Allocate separate ESP32 PWM timers for predictable servo output.
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
 
-  pan_servo.setPeriodHertz(50);
-  tilt_servo.setPeriodHertz(50);
-  pusher_servo.setPeriodHertz(50);
-  pan_servo.attach(PIN_PAN,       PAN_MIN_US, PAN_MAX_US);
-  tilt_servo.attach(PIN_TILT,     TILT_MIN_US, TILT_MAX_US);
-  pusher_servo.attach(PIN_PUSHER, PUSHER_HOME_US, PUSHER_PUSH_US);
+  panServo.setPeriodHertz(50);
+  tiltServo.setPeriodHertz(50);
+  pusherServo.setPeriodHertz(50);
 
-  disarm();
-  Serial.println("READY");
-  last_cmd_ms = millis();
+  panServo.attach(PAN_PIN, 500, 2500);
+  tiltServo.attach(TILT_PIN, 500, 2500);
+  pusherServo.attach(PUSHER_PIN, 500, 2500);
+
+  panServo.write(CENTER_PAN);
+  tiltServo.write(CENTER_TILT);
+  pusherServo.write(PUSHER_BACK);
+  setFlywheel(false);
+
+  Serial.println();
+  Serial.println("Buzzkill turret ready (DISARMED)");
+  printHelp();
 }
 
-char buf[64];
-size_t buf_len = 0;
-
 void loop() {
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n' || c == '\r') {
-      if (buf_len == 0) continue;
-      buf[buf_len] = '\0';
-      handle_line(buf);
-      buf_len = 0;
-    } else if (buf_len < sizeof(buf) - 1) {
-      buf[buf_len++] = c;
+  handleSerial();
+  updatePanTilt();
+  updateFiring();
+}
+
+// Collect one newline-terminated command without blocking the control loop.
+void handleSerial() {
+  while (Serial.available() > 0) {
+    const char incoming = static_cast<char>(Serial.read());
+
+    if (discardingSerialLine) {
+      if (incoming == '\r' || incoming == '\n') {
+        discardingSerialLine = false;
+      }
+      continue;
+    }
+
+    if (incoming == '\r' || incoming == '\n') {
+      if (serialLength == 0) {
+        continue;
+      }
+
+      serialBuffer[serialLength] = '\0';
+      serialLength = 0;
+
+      char command = '\0';
+      int panOffset = 0;
+      int tiltOffset = 0;
+      char extra = '\0';
+
+      // Aim is the only command that accepts arguments. The extra conversion
+      // rejects trailing junk such as "A 10 20 xyz".
+      if (serialBuffer[0] == 'A') {
+        if (sscanf(serialBuffer, " %c %d %d %c", &command, &panOffset,
+                   &tiltOffset, &extra) != 3) {
+          Serial.println("ERR: expected A <panOffset> <tiltOffset>");
+          continue;
+        }
+        movePanTilt(panOffset, tiltOffset);
+        continue;
+      }
+
+      // All remaining commands must be exactly one non-whitespace character.
+      if (sscanf(serialBuffer, " %c %c", &command, &extra) != 1) {
+        Serial.println("ERR: malformed command (H for help)");
+        continue;
+      }
+
+      switch (command) {
+        case 'F':
+          if (!armed) {
+            Serial.println("IGNORED: system is disarmed");
+          } else {
+            setFlywheel(true);
+            // An explicit ON command becomes the state preserved after a shot.
+            restoreFlywheelOff = false;
+          }
+          break;
+        case 'f':
+          if (fireState != FireState::IDLE) {
+            cancelFiring();
+            Serial.println("Firing cycle: cancelled");
+          }
+          setFlywheel(false);
+          break;
+        case 'P':
+          fireOnce();
+          break;
+        case 'S':
+          emergencyStop();
+          break;
+        case 'D':
+          disarm();
+          break;
+        case 'E':
+          arm();
+          break;
+        case 'H':
+          printHelp();
+          break;
+        default:
+          Serial.println("ERR: unknown command (H for help)");
+          break;
+      }
+    } else if (serialLength < SERIAL_BUFFER_SIZE - 1) {
+      serialBuffer[serialLength++] = incoming;
     } else {
-      buf_len = 0;   // overflow, drop line
-      Serial.println("ERR ovf");
+      // Drop an overlong line, including bytes that arrive in a later loop.
+      serialLength = 0;
+      discardingSerialLine = true;
+      Serial.println("ERR: command too long");
     }
   }
-  if (millis() - last_cmd_ms > WATCHDOG_MS) {
-    disarm();
+}
+
+// Set safe targets. updatePanTilt() performs the actual gradual movement.
+void movePanTilt(int panOffset, int tiltOffset) {
+  targetPan = constrain(CENTER_PAN + panOffset, PAN_MIN, PAN_MAX);
+  targetTilt = constrain(CENTER_TILT + tiltOffset, TILT_MIN, TILT_MAX);
+
+  Serial.print("Moving to Pan: ");
+  Serial.print(targetPan);
+  Serial.print(" deg, Tilt: ");
+  Serial.print(targetTilt);
+  Serial.println(" deg");
+
+  if (currentPan == targetPan && currentTilt == targetTilt) {
+    printAimStatus();
   }
+}
+
+void updatePanTilt() {
+  const unsigned long now = millis();
+  if (now - lastServoStepMs < SERVO_SPEED) {
+    return;
+  }
+  lastServoStepMs = now;
+
+  bool moved = false;
+  if (currentPan != targetPan) {
+    currentPan += (targetPan > currentPan) ? 1 : -1;
+    currentPan = constrain(currentPan, PAN_MIN, PAN_MAX);
+    panServo.write(currentPan);
+    moved = true;
+  }
+  if (currentTilt != targetTilt) {
+    currentTilt += (targetTilt > currentTilt) ? 1 : -1;
+    currentTilt = constrain(currentTilt, TILT_MIN, TILT_MAX);
+    tiltServo.write(currentTilt);
+    moved = true;
+  }
+
+  static bool wasMoving = false;
+  if (!moved && wasMoving) {
+    printAimStatus();
+  }
+  wasMoving = moved;
+}
+
+void setFlywheel(bool enabled) {
+  flywheelOn = enabled;
+  digitalWrite(FLYWHEEL_PIN, enabled ? HIGH : LOW);
+  Serial.println(enabled ? "Flywheel: ON" : "Flywheel: OFF");
+}
+
+void fireOnce() {
+  if (!armed) {
+    Serial.println("IGNORED: system is disarmed");
+    return;
+  }
+  if (fireState != FireState::IDLE) {
+    Serial.println("IGNORED: firing cycle already active");
+    return;
+  }
+
+  restoreFlywheelOff = !flywheelOn;
+  fireStateStartedMs = millis();
+  if (restoreFlywheelOff) {
+    setFlywheel(true);
+    Serial.println("Firing: spinning up");
+    fireState = FireState::SPINUP;
+  } else {
+    Serial.println("Firing: push");
+    pusherServo.write(PUSHER_FORWARD);
+    fireState = FireState::PUSHING;
+  }
+}
+
+void updateFiring() {
+  if (fireState == FireState::IDLE) {
+    return;
+  }
+
+  const unsigned long now = millis();
+  const unsigned long elapsed = now - fireStateStartedMs;
+
+  if (fireState == FireState::SPINUP && elapsed >= FLYWHEEL_SPINUP_MS) {
+    Serial.println("Firing: push");
+    pusherServo.write(PUSHER_FORWARD);
+    fireState = FireState::PUSHING;
+    fireStateStartedMs = now;
+  } else if (fireState == FireState::PUSHING && elapsed >= PUSHER_FORWARD_MS) {
+    pusherServo.write(PUSHER_BACK);
+    fireState = FireState::RETRACTING;
+    fireStateStartedMs = now;
+  } else if (fireState == FireState::RETRACTING && elapsed >= PUSHER_SETTLE_MS) {
+    if (restoreFlywheelOff) {
+      setFlywheel(false);
+    }
+    fireState = FireState::IDLE;
+    Serial.println("Firing cycle: complete");
+  }
+}
+
+void cancelFiring() {
+  pusherServo.write(PUSHER_BACK);
+  fireState = FireState::IDLE;
+  restoreFlywheelOff = false;
+}
+
+void arm() {
+  armed = true;
+  Serial.println("System: ARMED");
+}
+
+void disarm() {
+  armed = false;
+  cancelFiring();
+  setFlywheel(false);
+  Serial.println("System: DISARMED");
+}
+
+void emergencyStop() {
+  armed = false;
+  targetPan = CENTER_PAN;
+  targetTilt = CENTER_TILT;
+  cancelFiring();
+  setFlywheel(false);
+  Serial.println("EMERGENCY STOP: disarmed, pusher retracted, centering");
+}
+
+void printAimStatus() {
+  Serial.print("Pan: ");
+  Serial.print(currentPan);
+  Serial.println(" deg");
+  Serial.print("Tilt: ");
+  Serial.print(currentTilt);
+  Serial.println(" deg");
+}
+
+void printHelp() {
+  Serial.println("Commands:");
+  Serial.println("  A <panOffset> <tiltOffset>  Smooth aim relative to center");
+  Serial.println("  F                           Flywheel ON");
+  Serial.println("  f                           Flywheel OFF");
+  Serial.println("  P                           Fire once (armed only)");
+  Serial.println("  S                           Emergency stop and center");
+  Serial.println("  D                           Disarm");
+  Serial.println("  E                           Arm");
+  Serial.println("  H                           Show this help");
 }
