@@ -1,0 +1,10 @@
+{
+  "frame_w": 640,
+  "frame_h": 480,
+  "points": [
+    { "name": "top-left",     "px": 0,   "py": 0,   "pan": -30, "tilt":  20 },
+    { "name": "top-right",    "px": 640, "py": 0,   "pan":  30, "tilt":  20 },
+    { "name": "bottom-right", "px": 640, "py": 480, "pan":  30, "tilt": -20 },
+    { "name": "bottom-left",  "px": 0,   "py": 480, "pan": -30, "tilt": -20 }
+  ]
+}

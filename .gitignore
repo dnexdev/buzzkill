@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.o
+*.d
+qnx/build/
+.DS_Store
