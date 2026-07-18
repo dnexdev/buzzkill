@@ -243,28 +243,124 @@ void status_cb(camera_handle_t /*h*/, camera_devstatus_t status,
     LOGE("status: status=%d extra=%u", (int)status, (unsigned)extra);
 }
 
-// Try each format until one is accepted. Returns the first success.
-camera_error_t try_set_format(camera_handle_t handle, int w, int h) {
-    camera_error_t err;
-    const struct { camera_frametype_t fmt; const char* name; } tries[] = {
-        { CAMERA_FRAMETYPE_CBYCRY,   "CBYCRY"   },
-        { CAMERA_FRAMETYPE_BGR8888,  "BGR8888"  },
-        { CAMERA_FRAMETYPE_NV12,     "NV12"     },
-        { CAMERA_FRAMETYPE_RGB8888,  "RGB8888"  },
+const char* frametype_name(camera_frametype_t t) {
+    switch (t) {
+        case CAMERA_FRAMETYPE_NV12:     return "NV12";
+        case CAMERA_FRAMETYPE_NV16:     return "NV16";
+        case CAMERA_FRAMETYPE_NV24_Y12: return "NV24_Y12";
+        case CAMERA_FRAMETYPE_CBYCRY:   return "CBYCRY";
+        case CAMERA_FRAMETYPE_BGR8888:  return "BGR8888";
+        case CAMERA_FRAMETYPE_RGB8888:  return "RGB8888";
+        case CAMERA_FRAMETYPE_RGB888:   return "RGB888";
+        case CAMERA_FRAMETYPE_GRAY8:    return "GRAY8";
+        default: return "other";
+    }
+}
+
+// Pick a supported (format, resolution) pair. We can convert CBYCRY, NV12,
+// NV16, NV24_Y12, BGR8888, and RGB8888 to BGR. Prefer the resolution closest
+// to (want_w, want_h) but not larger — we want speed, not detail.
+camera_error_t pick_format_and_resolution(
+        camera_handle_t handle, int want_w, int want_h,
+        camera_frametype_t& chosen_fmt,
+        int& chosen_w, int& chosen_h) {
+    // Enumerate supported viewfinder frame types.
+    uint32_t n_types = 0;
+    camera_error_t err = camera_get_supported_vf_frame_types(handle, 0, &n_types, nullptr);
+    if (err != CAMERA_EOK) {
+        LOGE("get_supported_vf_frame_types(count): %s", err_str(err));
+        return err;
+    }
+    if (n_types == 0) {
+        LOGE("camera reports zero viewfinder frame types");
+        return CAMERA_EINVAL;
+    }
+    std::vector<camera_frametype_t> types(n_types);
+    uint32_t got = 0;
+    err = camera_get_supported_vf_frame_types(handle, n_types, &got, types.data());
+    if (err != CAMERA_EOK) {
+        LOGE("get_supported_vf_frame_types(list): %s", err_str(err));
+        return err;
+    }
+    LOGE("supported viewfinder frametypes (%u):", got);
+    for (uint32_t i = 0; i < got; ++i) {
+        LOGE("  [%u] %s (%d)", i, frametype_name(types[i]), (int)types[i]);
+    }
+
+    // Formats we can actually convert to BGR, in order of preference.
+    const camera_frametype_t preferred[] = {
+        CAMERA_FRAMETYPE_CBYCRY,
+        CAMERA_FRAMETYPE_NV12,
+        CAMERA_FRAMETYPE_NV16,
+        CAMERA_FRAMETYPE_NV24_Y12,
+        CAMERA_FRAMETYPE_BGR8888,
+        CAMERA_FRAMETYPE_RGB8888,
     };
-    for (const auto& t : tries) {
+
+    for (auto pref : preferred) {
+        // Is this format offered by the camera?
+        bool offered = false;
+        for (uint32_t i = 0; i < got; ++i) if (types[i] == pref) { offered = true; break; }
+        if (!offered) continue;
+
+        // Enumerate resolutions supported for this format.
+        uint32_t n_res = 0;
+        err = camera_get_supported_vf_resolutions(handle, pref, 0, &n_res, nullptr);
+        if (err != CAMERA_EOK || n_res == 0) {
+            LOGE("no resolutions for %s: %s", frametype_name(pref), err_str(err));
+            continue;
+        }
+        std::vector<camera_res_t> res(n_res);
+        uint32_t rgot = 0;
+        err = camera_get_supported_vf_resolutions(handle, pref, n_res, &rgot, res.data());
+        if (err != CAMERA_EOK) {
+            LOGE("get_supported_vf_resolutions(%s): %s",
+                 frametype_name(pref), err_str(err));
+            continue;
+        }
+        LOGE("%s supports %u resolutions:", frametype_name(pref), rgot);
+        for (uint32_t i = 0; i < rgot; ++i) {
+            LOGE("  [%u] %ux%u", i, res[i].width, res[i].height);
+        }
+
+        // Pick the smallest resolution >= (want_w, want_h). If nothing is that
+        // big, pick the largest available — we're not going to fail out over
+        // resolution when we have any working option.
+        int best_i = -1;
+        uint32_t best_score = UINT32_MAX;
+        for (uint32_t i = 0; i < rgot; ++i) {
+            uint32_t w = res[i].width, h = res[i].height;
+            if ((int)w < want_w || (int)h < want_h) continue;
+            uint32_t score = w * h;  // smallest area that meets the minimum
+            if (score < best_score) { best_score = score; best_i = (int)i; }
+        }
+        if (best_i < 0) {
+            // Nothing large enough; pick the biggest we have.
+            uint32_t big = 0;
+            for (uint32_t i = 0; i < rgot; ++i) {
+                uint32_t area = res[i].width * res[i].height;
+                if (area > big) { big = area; best_i = (int)i; }
+            }
+        }
+        if (best_i < 0) continue;
+
+        camera_res_t r = res[best_i];
         err = camera_set_vf_property(
             handle,
-            CAMERA_IMGPROP_WIDTH,  w,
-            CAMERA_IMGPROP_HEIGHT, h,
-            CAMERA_IMGPROP_FORMAT, t.fmt);
+            CAMERA_IMGPROP_FORMAT, pref,
+            CAMERA_IMGPROP_WIDTH,  (int)r.width,
+            CAMERA_IMGPROP_HEIGHT, (int)r.height);
         if (err == CAMERA_EOK) {
-            LOGE("using %s @ %dx%d", t.name, w, h);
+            LOGE("selected %s @ %ux%u", frametype_name(pref), r.width, r.height);
+            chosen_fmt = pref;
+            chosen_w = (int)r.width;
+            chosen_h = (int)r.height;
             return CAMERA_EOK;
         }
-        LOGE("format %s not accepted: %s", t.name, err_str(err));
+        LOGE("set_vf_property(%s, %ux%u) failed: %s",
+             frametype_name(pref), r.width, r.height, err_str(err));
     }
-    return err;
+    return CAMERA_EINVAL;
 }
 
 } // namespace
@@ -300,12 +396,16 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    err = try_set_format(handle, req_w, req_h);
+    camera_frametype_t chosen_fmt;
+    int chosen_w = 0, chosen_h = 0;
+    err = pick_format_and_resolution(handle, req_w, req_h,
+                                     chosen_fmt, chosen_w, chosen_h);
     if (err != CAMERA_EOK) {
-        LOGE("no supported format worked");
+        LOGE("no supported (format, resolution) worked");
         camera_close(handle);
         return 2;
     }
+    (void)chosen_fmt; (void)chosen_w; (void)chosen_h;
 
     err = camera_start_viewfinder(handle, viewfinder_cb, status_cb, nullptr);
     if (err != CAMERA_EOK) {
