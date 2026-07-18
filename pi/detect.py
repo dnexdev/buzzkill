@@ -238,6 +238,18 @@ def main():
     fps = 0.0
     pkt_count = 0
 
+    # OpenCV on QNX is built without GUI support (no GTK / Cocoa).
+    # Try imshow once with a 1x1 frame; if it throws, run headless.
+    gui_disabled = args.no_preview
+    if not gui_disabled:
+        try:
+            cv2.imshow("__probe__", np.zeros((1, 1, 3), dtype=np.uint8))
+            cv2.waitKey(1)
+            cv2.destroyWindow("__probe__")
+        except cv2.error as e:
+            print(f"[detect] cv2.imshow unavailable ({str(e).splitlines()[0][:80]}...) — running headless")
+            gui_disabled = True
+
     print(f"[detect] {args.width}x{args.height} → udp {host}:{port}. press q to quit.")
 
     while True:
@@ -473,7 +485,7 @@ def main():
             fps_count = 0
             fps_t0 = ts
 
-        if not args.no_preview:
+        if not args.no_preview and not gui_disabled:
             # Draw rejected blobs in yellow with the reason so we can tune.
             for c, a, reason in rejected:
                 x, y, ww, hh = cv2.boundingRect(c)
@@ -524,7 +536,9 @@ def main():
                            cv2.addWeighted(colored, 0.7, combined3, 0.5, 0))
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
+            if key == 0xFF:  # nothing pressed
+                pass
+            elif key == ord("q"):
                 break
             elif key == ord("t") and best is not None:
                 # Capture the currently-locked target's contour as the template.
