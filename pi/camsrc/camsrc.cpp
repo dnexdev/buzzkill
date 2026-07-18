@@ -297,54 +297,52 @@ camera_error_t pick_format_and_resolution(
         CAMERA_FRAMETYPE_RGB8888,
     };
 
+    // Enumerate supported viewfinder resolutions (not per-format on this API).
+    uint32_t n_res = 0;
+    err = camera_get_supported_vf_resolutions(handle, 0, &n_res, nullptr);
+    if (err != CAMERA_EOK || n_res == 0) {
+        LOGE("get_supported_vf_resolutions(count): %s", err_str(err));
+        return err ? err : CAMERA_EINVAL;
+    }
+    std::vector<camera_res_t> res(n_res);
+    uint32_t rgot = 0;
+    err = camera_get_supported_vf_resolutions(handle, n_res, &rgot, res.data());
+    if (err != CAMERA_EOK) {
+        LOGE("get_supported_vf_resolutions(list): %s", err_str(err));
+        return err;
+    }
+    LOGE("supported viewfinder resolutions (%u):", rgot);
+    for (uint32_t i = 0; i < rgot; ++i) {
+        LOGE("  [%u] %ux%u", i, res[i].width, res[i].height);
+    }
+
+    // Pick the smallest resolution >= (want_w, want_h). If nothing meets that,
+    // fall back to the largest available.
+    int best_i = -1;
+    uint32_t best_score = UINT32_MAX;
+    for (uint32_t i = 0; i < rgot; ++i) {
+        uint32_t w = res[i].width, h = res[i].height;
+        if ((int)w < want_w || (int)h < want_h) continue;
+        uint32_t score = w * h;
+        if (score < best_score) { best_score = score; best_i = (int)i; }
+    }
+    if (best_i < 0) {
+        uint32_t big = 0;
+        for (uint32_t i = 0; i < rgot; ++i) {
+            uint32_t area = res[i].width * res[i].height;
+            if (area > big) { big = area; best_i = (int)i; }
+        }
+    }
+    if (best_i < 0) return CAMERA_EINVAL;
+    camera_res_t r = res[best_i];
+    LOGE("target resolution %ux%u", r.width, r.height);
+
+    // Try each preferred format at that resolution until one succeeds.
     for (auto pref : preferred) {
-        // Is this format offered by the camera?
         bool offered = false;
         for (uint32_t i = 0; i < got; ++i) if (types[i] == pref) { offered = true; break; }
         if (!offered) continue;
 
-        // Enumerate resolutions supported for this format.
-        uint32_t n_res = 0;
-        err = camera_get_supported_vf_resolutions(handle, pref, 0, &n_res, nullptr);
-        if (err != CAMERA_EOK || n_res == 0) {
-            LOGE("no resolutions for %s: %s", frametype_name(pref), err_str(err));
-            continue;
-        }
-        std::vector<camera_res_t> res(n_res);
-        uint32_t rgot = 0;
-        err = camera_get_supported_vf_resolutions(handle, pref, n_res, &rgot, res.data());
-        if (err != CAMERA_EOK) {
-            LOGE("get_supported_vf_resolutions(%s): %s",
-                 frametype_name(pref), err_str(err));
-            continue;
-        }
-        LOGE("%s supports %u resolutions:", frametype_name(pref), rgot);
-        for (uint32_t i = 0; i < rgot; ++i) {
-            LOGE("  [%u] %ux%u", i, res[i].width, res[i].height);
-        }
-
-        // Pick the smallest resolution >= (want_w, want_h). If nothing is that
-        // big, pick the largest available — we're not going to fail out over
-        // resolution when we have any working option.
-        int best_i = -1;
-        uint32_t best_score = UINT32_MAX;
-        for (uint32_t i = 0; i < rgot; ++i) {
-            uint32_t w = res[i].width, h = res[i].height;
-            if ((int)w < want_w || (int)h < want_h) continue;
-            uint32_t score = w * h;  // smallest area that meets the minimum
-            if (score < best_score) { best_score = score; best_i = (int)i; }
-        }
-        if (best_i < 0) {
-            // Nothing large enough; pick the biggest we have.
-            uint32_t big = 0;
-            for (uint32_t i = 0; i < rgot; ++i) {
-                uint32_t area = res[i].width * res[i].height;
-                if (area > big) { big = area; best_i = (int)i; }
-            }
-        }
-        if (best_i < 0) continue;
-
-        camera_res_t r = res[best_i];
         err = camera_set_vf_property(
             handle,
             CAMERA_IMGPROP_FORMAT, pref,
