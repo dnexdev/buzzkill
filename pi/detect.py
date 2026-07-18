@@ -55,51 +55,58 @@ def main():
     ap.add_argument("--width",  type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
 
-    ap.add_argument("--dark-threshold", type=int, default=80,
-                    help="pixel < this counts as dark (0-255)")
-    ap.add_argument("--min-area", type=int, default=60,
-                    help="min contour area in pixels")
-    ap.add_argument("--max-area", type=int, default=1500,
-                    help="max contour area — tighten to reject people/clothes")
-    ap.add_argument("--history", type=int, default=200,
-                    help="MOG2 background history frames")
+    # Tuned defaults for the demo (black mosquitoes on white background).
+    # Loose enough to catch small (far away) and blurred (moving) mosquitoes.
+    ap.add_argument("--dark-threshold", type=int, default=110)
+    ap.add_argument("--adaptive", action="store_true",
+                    help="use adaptive thresholding instead of global --dark-threshold. "
+                         "handles lighting variation automatically — brightly lit rooms, "
+                         "dim rooms, uneven lighting all look the same to the pipeline.")
+    ap.add_argument("--adaptive-block", type=int, default=51,
+                    help="[adaptive] neighborhood size in pixels; must be odd. "
+                         "larger = smoother, smaller = more local variation captured.")
+    ap.add_argument("--adaptive-c", type=int, default=10,
+                    help="[adaptive] constant subtracted from local mean. "
+                         "higher = fewer dark pixels detected.")
+    ap.add_argument("--min-area", type=int, default=20)
+    ap.add_argument("--max-area", type=int, default=3000)
+    ap.add_argument("--max-compactness", type=float, default=1.0,
+                    help="4πA/P². disabled by default (1.0). tighten to reject smooth blobs.")
+    ap.add_argument("--history", type=int, default=200)
     ap.add_argument("--var-threshold", type=int, default=32)
-    ap.add_argument("--shadow-threshold", type=float, default=0.5,
-                    help="MOG2 shadow strictness; lower = more shadows rejected")
-    ap.add_argument("--motion-dilate", type=int, default=15,
-                    help="dilate motion mask by N px before ANDing with darkness. "
-                         "prevents fragmentation when only part of the target moved.")
-    ap.add_argument("--close-kernel", type=int, default=11,
-                    help="morph-close kernel size (px). bigger = reconnects fragments harder.")
-    ap.add_argument("--min-fill", type=float, default=0.55,
-                    help="fraction of the contour's interior that must actually be dark. "
-                         "1.0 = perfect ink blob; shadows on textured surfaces score much lower.")
+    ap.add_argument("--shadow-threshold", type=float, default=0.5)
+    ap.add_argument("--motion-dilate", type=int, default=15)
+    ap.add_argument("--close-kernel", type=int, default=11)
+    ap.add_argument("--min-fill", type=float, default=0.35)
 
-    # Demo-overfit mode: guaranteed white background.
+    # Demo mode: guaranteed white background.
     ap.add_argument("--white-bg", action="store_true",
-                    help="skip MOG2 and use pure darkness threshold. "
-                         "cleaner when background is guaranteed light-colored.")
-    ap.add_argument("--min-motion", type=float, default=5.0,
-                    help="[white-bg mode] min pixels moved between frames to count as target. "
-                         "prevents locking on static printed mosquitoes.")
+                    help="skip MOG2 and use pure darkness threshold.")
+    ap.add_argument("--min-motion", type=float, default=3.0)
+    ap.add_argument("--min-bg-brightness", type=int, default=180)
+    ap.add_argument("--bg-ring-px", type=int, default=6,
+                    help="ring width for background check. small enough not to "
+                         "reach into adjacent mosquitoes on a dense sheet.")
+    ap.add_argument("--min-contrast", type=int, default=100)
+    ap.add_argument("--white-cutoff", type=int, default=200,
+                    help="pixel > this counts as white for ring-purity check")
+    ap.add_argument("--min-white-fraction", type=float, default=0.35,
+                    help="ring around blob must be this fraction white or higher. "
+                         "large non-white regions (face, hair) tank this below 0.3.")
 
-    # Shape filters — the "overfit to our demo mosquito" knobs.
-    ap.add_argument("--aspect-min", type=float, default=0.0,
-                    help="min longer/shorter side ratio; 1.5 rejects square blobs")
-    ap.add_argument("--aspect-max", type=float, default=99.0,
-                    help="max longer/shorter side ratio; caps ultra-thin blobs")
-    ap.add_argument("--min-solidity", type=float, default=0.0,
-                    help="area / convex-hull area. mosquito ~0.4-0.6, phone ~1.0. set 0.3 to reject phones/shirts")
-    ap.add_argument("--max-solidity", type=float, default=1.0,
-                    help="upper bound on solidity. set 0.85 to reject any near-rectangle")
-    ap.add_argument("--min-extent", type=float, default=0.0,
-                    help="area / bounding-box area. mosquito ~0.4, phone ~1.0")
-    ap.add_argument("--max-extent", type=float, default=1.0,
-                    help="upper bound on extent. set 0.85 to reject any near-rectangle")
+    # Shape filters — loose; a moving mosquito is a smeared streak, not a silhouette.
+    ap.add_argument("--aspect-min", type=float, default=0.0)
+    ap.add_argument("--aspect-max", type=float, default=99.0)
+    ap.add_argument("--min-solidity", type=float, default=0.10)
+    ap.add_argument("--max-solidity", type=float, default=0.99)
+    ap.add_argument("--min-extent", type=float, default=0.05)
+    ap.add_argument("--max-extent", type=float, default=0.95)
     ap.add_argument("--template", default="template.npy",
                     help="path to saved shape template (auto-loaded if present)")
-    ap.add_argument("--shape-tolerance", type=float, default=0.5,
-                    help="max matchShapes distance vs template; lower = stricter")
+    ap.add_argument("--shape-tolerance", type=float, default=999.0)
+    ap.add_argument("--shape-min-area", type=int, default=200,
+                    help="only apply shape-template match on blobs bigger than this. "
+                         "small blobs have too few points for stable Hu moments.")
 
     ap.add_argument("--no-preview", action="store_true")
     ap.add_argument("--show-mask", action="store_true",
@@ -163,7 +170,16 @@ def main():
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # --- darkness mask (always) ---
-        _, dark = cv2.threshold(gray, args.dark_threshold, 255, cv2.THRESH_BINARY_INV)
+        if args.adaptive:
+            # Lighting-invariant: each pixel compared to its local neighborhood
+            # instead of a fixed threshold. Handles spotlights, shadows, dim rooms.
+            block = args.adaptive_block if args.adaptive_block % 2 == 1 else args.adaptive_block + 1
+            dark = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV,
+                block, args.adaptive_c,
+            )
+        else:
+            _, dark = cv2.threshold(gray, args.dark_threshold, 255, cv2.THRESH_BINARY_INV)
 
         if args.white_bg:
             # Overfit for a white-background demo: skip MOG2 entirely.
@@ -235,29 +251,84 @@ def main():
                 rejected.append((c, a, f"ext>{extent:.2f}"))
                 continue
 
-            # Fill-density: how much of the contour's interior is actually dark?
-            # Real ink blob = ~1.0. Shadow on textured surface = ~0.3-0.5 because
-            # the shadow isn't uniformly below the dark threshold.
+            # Compactness — 4πA/P². The mosquito's signature.
+            # Smooth blobs (eyebrows, shadows, phones, hands) score 0.5-0.9.
+            # Mosquitoes with legs and antennae score 0.05-0.25.
+            # This is lighting- and rotation-invariant.
+            perimeter = cv2.arcLength(c, True)
+            if perimeter < 1.0:
+                rejected.append((c, a, "no-perimeter"))
+                continue
+            compactness = (4.0 * 3.14159 * a) / (perimeter * perimeter)
+            if compactness > args.max_compactness:
+                rejected.append((c, a, f"smooth {compactness:.2f}"))
+                continue
+
+            # Interior mask, reused by fill / brightness / contrast checks.
             blob_mask = np.zeros(gray.shape, dtype=np.uint8)
             cv2.drawContours(blob_mask, [c], -1, 255, thickness=cv2.FILLED)
             interior_pixels = int(cv2.countNonZero(blob_mask))
-            if interior_pixels > 0:
-                dark_in_blob = int(cv2.countNonZero(cv2.bitwise_and(dark, blob_mask)))
-                fill = dark_in_blob / interior_pixels
-            else:
-                fill = 0.0
+            if interior_pixels <= 0:
+                rejected.append((c, a, "zero-mask"))
+                continue
+
+            # Fill-density: how much of the contour's interior is actually dark?
+            dark_in_blob = int(cv2.countNonZero(cv2.bitwise_and(dark, blob_mask)))
+            fill = dark_in_blob / interior_pixels
             if fill < args.min_fill:
                 rejected.append((c, a, f"fill {fill:.2f}"))
                 continue
 
+            # Background whiteness: sample a ring around the blob and require
+            # MOST of it to be near-white. Mean fails here — an eyebrow's ring
+            # is half sheet (bright) + half face (dark), averaging to "ok" while
+            # clearly not being on a white background. Fraction-of-white is
+            # much stricter and rejects any blob touching a non-sheet region.
+            ring_kernel = np.ones((args.bg_ring_px, args.bg_ring_px), np.uint8)
+            ring = cv2.subtract(cv2.dilate(blob_mask, ring_kernel), blob_mask)
+            ring_size = int(cv2.countNonZero(ring))
+            bg_brightness = 0.0
+            white_fraction = 0.0
+            if ring_size > 0:
+                bg_brightness = float(cv2.mean(gray, mask=ring)[0])
+                # Fraction of the ring that is genuinely white (above white-cutoff).
+                _, white_mask = cv2.threshold(gray, args.white_cutoff, 255, cv2.THRESH_BINARY)
+                white_in_ring = int(cv2.countNonZero(cv2.bitwise_and(white_mask, ring)))
+                white_fraction = white_in_ring / ring_size
+            if white_fraction < args.min_white_fraction:
+                rejected.append((c, a, f"nonwhite {white_fraction:.2f}"))
+                continue
+            if bg_brightness < args.min_bg_brightness:
+                rejected.append((c, a, f"bg {int(bg_brightness)}"))
+                continue
+            # Contrast: blob interior must be MUCH darker than its surroundings.
+            blob_brightness = float(cv2.mean(gray, mask=blob_mask)[0])
+            contrast = bg_brightness - blob_brightness
+            if contrast < args.min_contrast:
+                rejected.append((c, a, f"contrast {int(contrast)}"))
+                continue
+
+            # Confidence — how strongly did this blob pass every filter?
+            # Products of normalized scores so weakness in any dimension hurts.
+            c_dark    = 1.0 - blob_brightness / 255.0                  # darker = better
+            c_white   = white_fraction                                  # ring whiter = better
+            c_contr   = min(1.0, contrast / 200.0)                      # 200+ gap = perfect
+            c_fill    = min(1.0, fill / 0.9)                            # solid interior = better
+            confidence_val = c_dark * c_white * c_contr * c_fill
+            # Bookkeeping — final struct assembled after shape match below.
+            _blob_stats = (confidence_val,)
+
             # Shape template match: reject blobs that don't look like the template.
-            if template_contour is not None:
-                # matchShapes uses Hu moments — scale + rotation invariant.
-                dist = cv2.matchShapes(c, template_contour,
-                                       cv2.CONTOURS_MATCH_I1, 0.0)
-                if dist > args.shape_tolerance:
-                    rejected.append((c, a, f"shape {dist:.2f}"))
+            # Only bother for blobs big enough to have a stable Hu-moment signature.
+            shape_dist = 0.0
+            if template_contour is not None and a >= args.shape_min_area:
+                shape_dist = cv2.matchShapes(c, template_contour,
+                                             cv2.CONTOURS_MATCH_I1, 0.0)
+                if shape_dist > args.shape_tolerance:
+                    rejected.append((c, a, f"shape {shape_dist:.2f}"))
                     continue
+                # Bake the shape score into confidence too.
+                confidence_val *= max(0.0, 1.0 - shape_dist / args.shape_tolerance)
 
             M = cv2.moments(c)
             if M["m00"] <= 0:
@@ -265,7 +336,7 @@ def main():
                 continue
             ccx = M["m10"] / M["m00"]
             ccy = M["m01"] / M["m00"]
-            candidates.append((c, a, ccx, ccy))
+            candidates.append((c, a, ccx, ccy, confidence_val))
 
         # ---- Target selection ----
         best = None
@@ -275,41 +346,20 @@ def main():
         confidence = 0.0
         detected = False
 
-        if args.white_bg and candidates:
-            # White-bg mode: match each candidate to nearest previous centroid,
-            # pick the one that moved the most. This filters out static prints.
-            best_disp = -1.0
-            for c, a, ccx, ccy in candidates:
-                if prev_centroids:
-                    dmin = min(
-                        ((ccx - px) ** 2 + (ccy - py) ** 2) ** 0.5
-                        for px, py in prev_centroids
-                    )
-                else:
-                    dmin = 0.0
-                if dmin > best_disp:
-                    best_disp = dmin
+        if candidates:
+            # AIM target = highest-confidence blob. Simple, robust.
+            best_conf = -1.0
+            for c, a, ccx, ccy, cf in candidates:
+                if cf > best_conf:
+                    best_conf = cf
                     best = c
                     best_area = a
                     cx, cy = ccx, ccy
-            if best_disp >= args.min_motion:
-                detected = True
-            else:
-                best = None
-                for c, a, _, _ in candidates:
-                    rejected.append((c, a, f"static {best_disp:.1f}"))
-        elif candidates:
-            # Motion-mask mode: MOG2 already guaranteed movement, so just pick
-            # the biggest passing blob.
-            for c, a, ccx, ccy in candidates:
-                if a > best_area:
-                    best_area = a
-                    best = c
-                    cx, cy = ccx, ccy
+                    confidence = cf
             detected = True
 
         # Remember every valid centroid for next frame's white-bg tracking.
-        prev_centroids = [(ccx, ccy) for _, _, ccx, ccy in candidates]
+        prev_centroids = [(ccx, ccy) for _, _, ccx, ccy, _ in candidates]
 
         if detected:
             if prev_pt is not None and prev_ts is not None:
@@ -348,24 +398,29 @@ def main():
                 cv2.putText(frame, f"{reason} a={int(a)}", (x, y - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-            if detected:
-                x, y, ww, hh = cv2.boundingRect(best)
-                cv2.rectangle(frame, (x, y), (x + ww, y + hh), (0, 255, 0), 2)
-                cv2.circle(frame, (int(cx), int(cy)), 4, (0, 0, 255), -1)
-                # Velocity vector — shows where we're leading toward.
-                end = (int(cx + vx * 0.12), int(cy + vy * 0.12))
-                cv2.arrowedLine(frame, (int(cx), int(cy)), end,
-                                (255, 255, 0), 2, tipLength=0.3)
-                cv2.putText(frame,
-                            f"TARGET a={int(best_area)} conf={confidence:.2f}",
-                            (x, y - 6), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5, (0, 255, 0), 1)
+            # Draw every mosquito. AIM (highest conf) = blue. Others = green.
+            for c, a, ccx, ccy, cf in candidates:
+                x, y, ww, hh = cv2.boundingRect(c)
+                is_aim = (best is not None) and (c is best)
+                if is_aim:
+                    # Blue box + crosshair + velocity vector for the aim target.
+                    cv2.rectangle(frame, (x, y), (x + ww, y + hh), (255, 128, 0), 3)
+                    cv2.drawMarker(frame, (int(ccx), int(ccy)), (0, 0, 255),
+                                   cv2.MARKER_CROSS, 20, 2)
+                    end = (int(ccx + vx * 0.12), int(ccy + vy * 0.12))
+                    cv2.arrowedLine(frame, (int(ccx), int(ccy)), end,
+                                    (0, 255, 255), 2, tipLength=0.3)
+                    cv2.putText(frame, f"AIM c={cf:.2f}", (x, y - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 128, 0), 2)
+                else:
+                    cv2.rectangle(frame, (x, y), (x + ww, y + hh), (0, 255, 0), 1)
+                    cv2.putText(frame, f"c={cf:.2f}", (x, y - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
 
             template_status = "TEMPLATE ON" if template_contour is not None else "no template (T to capture)"
             mode = "WHITE-BG" if args.white_bg else "motion"
             cv2.putText(frame,
-                        f"fps={fps:4.1f}  pkts={pkt_count}  "
-                        f"dark<{args.dark_threshold}  area=[{args.min_area},{args.max_area}]  "
+                        f"fps={fps:4.1f}  targets={len(candidates)}  "
                         f"rej={len(rejected)}  [{mode}]  [{template_status}]",
                         (10, 20), cv2.FONT_HERSHEY_SIMPLEX,
                         0.5, (0, 255, 255), 1)
