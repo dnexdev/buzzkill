@@ -64,11 +64,24 @@ def main():
     ap.add_argument("--history", type=int, default=200,
                     help="MOG2 background history frames")
     ap.add_argument("--var-threshold", type=int, default=32)
+    ap.add_argument("--shadow-threshold", type=float, default=0.5,
+                    help="MOG2 shadow strictness; lower = more shadows rejected")
     ap.add_argument("--motion-dilate", type=int, default=15,
                     help="dilate motion mask by N px before ANDing with darkness. "
                          "prevents fragmentation when only part of the target moved.")
     ap.add_argument("--close-kernel", type=int, default=11,
                     help="morph-close kernel size (px). bigger = reconnects fragments harder.")
+    ap.add_argument("--min-fill", type=float, default=0.55,
+                    help="fraction of the contour's interior that must actually be dark. "
+                         "1.0 = perfect ink blob; shadows on textured surfaces score much lower.")
+
+    # Demo-overfit mode: guaranteed white background.
+    ap.add_argument("--white-bg", action="store_true",
+                    help="skip MOG2 and use pure darkness threshold. "
+                         "cleaner when background is guaranteed light-colored.")
+    ap.add_argument("--min-motion", type=float, default=5.0,
+                    help="[white-bg mode] min pixels moved between frames to count as target. "
+                         "prevents locking on static printed mosquitoes.")
 
     # Shape filters — the "overfit to our demo mosquito" knobs.
     ap.add_argument("--aspect-min", type=float, default=0.0,
@@ -113,8 +126,11 @@ def main():
     bg = cv2.createBackgroundSubtractorMOG2(
         history=args.history,
         varThreshold=args.var_threshold,
-        detectShadows=False,
+        detectShadows=True,   # marks shadow pixels as 127 so we can drop them
     )
+    # Shadows drift lower/higher based on lighting — 0.5 rejects most soft shadows,
+    # 0.7 is stricter (rejects harsher shadows too, at slight cost to real detections).
+    bg.setShadowThreshold(args.shadow_threshold)
     open_kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                              (args.close_kernel, args.close_kernel))
@@ -124,6 +140,7 @@ def main():
     prev_pt = None
     prev_ts = None
     lost_frames = 0
+    prev_centroids = []  # white-bg mode: candidate centroids from last frame
 
     fps_t0 = time.monotonic()
     fps_count = 0
@@ -145,18 +162,24 @@ def main():
         # ~2x faster than running MOG2 on color and loses nothing for this task.
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # --- motion mask ---
-        motion_raw = bg.apply(gray)
-        # Widen the "where motion happened" region so darkness inside that
-        # neighborhood joins the target. Without this, a swinging mosquito's
-        # near-stationary body is dropped and we only see the wing tip.
-        motion = cv2.dilate(motion_raw, dilate_kernel)
-
-        # --- darkness mask ---
+        # --- darkness mask (always) ---
         _, dark = cv2.threshold(gray, args.dark_threshold, 255, cv2.THRESH_BINARY_INV)
 
-        # --- combined mask: (roughly moving) AND dark ---
-        mask = cv2.bitwise_and(motion, dark)
+        if args.white_bg:
+            # Overfit for a white-background demo: skip MOG2 entirely.
+            # Every dark blob is a candidate. Tracking below picks the mover.
+            motion = np.zeros_like(dark)     # unused; keep for the show-mask viz
+            mask = dark
+        else:
+            # --- motion mask ---
+            motion_raw = bg.apply(gray)
+            # MOG2 marks shadows as 127 and true foreground as 255. Drop shadows
+            # by keeping only strong foreground pixels before dilating.
+            _, motion_fg = cv2.threshold(motion_raw, 200, 255, cv2.THRESH_BINARY)
+            # Widen the "where motion happened" region so darkness inside that
+            # neighborhood joins the target.
+            motion = cv2.dilate(motion_fg, dilate_kernel)
+            mask = cv2.bitwise_and(motion, dark)
 
         # Clean up speckle, then aggressively reconnect fragments.
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  open_kernel)
@@ -165,11 +188,10 @@ def main():
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Pick the biggest blob within area bounds AND matching shape constraints.
-        # Keep the rejected ones around so we can draw them in the preview for tuning.
-        best = None
-        best_area = 0.0
-        rejected = []  # list of (contour, area, reason)
+        # Collect blobs that pass area + shape filters. Then either pick the
+        # biggest (motion-mask mode) or the mover (white-bg mode).
+        candidates = []  # list of (contour, area, cx, cy)
+        rejected = []    # list of (contour, area, reason)
         for c in contours:
             a = float(cv2.contourArea(c))
             if a < args.min_area:
@@ -213,6 +235,21 @@ def main():
                 rejected.append((c, a, f"ext>{extent:.2f}"))
                 continue
 
+            # Fill-density: how much of the contour's interior is actually dark?
+            # Real ink blob = ~1.0. Shadow on textured surface = ~0.3-0.5 because
+            # the shadow isn't uniformly below the dark threshold.
+            blob_mask = np.zeros(gray.shape, dtype=np.uint8)
+            cv2.drawContours(blob_mask, [c], -1, 255, thickness=cv2.FILLED)
+            interior_pixels = int(cv2.countNonZero(blob_mask))
+            if interior_pixels > 0:
+                dark_in_blob = int(cv2.countNonZero(cv2.bitwise_and(dark, blob_mask)))
+                fill = dark_in_blob / interior_pixels
+            else:
+                fill = 0.0
+            if fill < args.min_fill:
+                rejected.append((c, a, f"fill {fill:.2f}"))
+                continue
+
             # Shape template match: reject blobs that don't look like the template.
             if template_contour is not None:
                 # matchShapes uses Hu moments — scale + rotation invariant.
@@ -222,21 +259,57 @@ def main():
                     rejected.append((c, a, f"shape {dist:.2f}"))
                     continue
 
-            if a > best_area:
-                best_area = a
-                best = c
+            M = cv2.moments(c)
+            if M["m00"] <= 0:
+                rejected.append((c, a, "zero-moment"))
+                continue
+            ccx = M["m10"] / M["m00"]
+            ccy = M["m01"] / M["m00"]
+            candidates.append((c, a, ccx, ccy))
 
+        # ---- Target selection ----
+        best = None
+        best_area = 0.0
         cx = cy = 0.0
         vx = vy = 0.0
         confidence = 0.0
         detected = False
 
-        if best is not None:
-            M = cv2.moments(best)
-            if M["m00"] > 0:
-                cx = M["m10"] / M["m00"]
-                cy = M["m01"] / M["m00"]
+        if args.white_bg and candidates:
+            # White-bg mode: match each candidate to nearest previous centroid,
+            # pick the one that moved the most. This filters out static prints.
+            best_disp = -1.0
+            for c, a, ccx, ccy in candidates:
+                if prev_centroids:
+                    dmin = min(
+                        ((ccx - px) ** 2 + (ccy - py) ** 2) ** 0.5
+                        for px, py in prev_centroids
+                    )
+                else:
+                    dmin = 0.0
+                if dmin > best_disp:
+                    best_disp = dmin
+                    best = c
+                    best_area = a
+                    cx, cy = ccx, ccy
+            if best_disp >= args.min_motion:
                 detected = True
+            else:
+                best = None
+                for c, a, _, _ in candidates:
+                    rejected.append((c, a, f"static {best_disp:.1f}"))
+        elif candidates:
+            # Motion-mask mode: MOG2 already guaranteed movement, so just pick
+            # the biggest passing blob.
+            for c, a, ccx, ccy in candidates:
+                if a > best_area:
+                    best_area = a
+                    best = c
+                    cx, cy = ccx, ccy
+            detected = True
+
+        # Remember every valid centroid for next frame's white-bg tracking.
+        prev_centroids = [(ccx, ccy) for _, _, ccx, ccy in candidates]
 
         if detected:
             if prev_pt is not None and prev_ts is not None:
@@ -289,10 +362,11 @@ def main():
                             0.5, (0, 255, 0), 1)
 
             template_status = "TEMPLATE ON" if template_contour is not None else "no template (T to capture)"
+            mode = "WHITE-BG" if args.white_bg else "motion"
             cv2.putText(frame,
                         f"fps={fps:4.1f}  pkts={pkt_count}  "
                         f"dark<{args.dark_threshold}  area=[{args.min_area},{args.max_area}]  "
-                        f"rej={len(rejected)}  [{template_status}]",
+                        f"rej={len(rejected)}  [{mode}]  [{template_status}]",
                         (10, 20), cv2.FONT_HERSHEY_SIMPLEX,
                         0.5, (0, 255, 255), 1)
             cv2.putText(frame, "T=capture template  C=clear  Q=quit",
