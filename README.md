@@ -1,4 +1,5 @@
 # buzzkill
+![BuzzKill Logo](buzzkill_logo_mark_only.png)
 
 Nerf turret that shoots swinging paper mosquitoes. Hack the 6ix 2026.
 
