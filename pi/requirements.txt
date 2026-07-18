@@ -1,3 +1,7 @@
+# On QNX Pi: cv2 and numpy come from the system (apk), NOT pip.
+#   sudo apk add py3-opencv py3-numpy
+#   python3 -m venv .venv --system-site-packages
+#   source .venv/bin/activate
+#   pip install -r requirements.txt
+
 pyserial>=3.5
-opencv-python>=4.8
-numpy>=1.24
