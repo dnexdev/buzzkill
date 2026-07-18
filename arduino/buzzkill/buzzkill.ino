@@ -1,22 +1,22 @@
-// Buzzkill turret firmware for an ESP32 DevKit.
+// Buzzkill turret firmware for the Arduino UNO Q's STM32 microcontroller.
 //
 // The command interface is intentionally line-oriented so it works from both
 // the Arduino Serial Monitor and a Raspberry Pi/QNX serial process.
 
 // IMPORTANT: Power the servos from a regulated external 5 V supply. Connect
-// the servo supply ground to ESP32 ground. Drive the flywheel through a proper
+// the servo supply ground to UNO Q ground. Drive the flywheel through a proper
 // logic-level N-channel MOSFET and flyback protection suitable for the motor.
 
-#include <ESP32Servo.h>
+#include <Servo.h>
 
 // ---------------------------------------------------------------------------
 // Hardware and tuning configuration
 // ---------------------------------------------------------------------------
 
-constexpr int PAN_PIN = 13;
-constexpr int TILT_PIN = 12;
-constexpr int PUSHER_PIN = 14;
-constexpr int FLYWHEEL_PIN = 27;
+constexpr int PAN_PIN = 9;       // D9
+constexpr int TILT_PIN = 10;     // D10
+constexpr int PUSHER_PIN = 11;   // D11
+constexpr int FLYWHEEL_PIN = 6;  // D6
 
 constexpr int CENTER_PAN = 90;
 constexpr int CENTER_TILT = 90;
@@ -36,7 +36,7 @@ constexpr unsigned long PUSHER_SETTLE_MS = 180;
 // Delay in milliseconds between one-degree servo steps. Lower is faster.
 constexpr unsigned long SERVO_SPEED = 12;
 
-constexpr size_t SERIAL_BUFFER_SIZE = 64;
+constexpr size_t COMMAND_BUFFER_SIZE = 64;
 
 Servo panServo;
 Servo tiltServo;
@@ -56,7 +56,7 @@ FireState fireState = FireState::IDLE;
 unsigned long fireStateStartedMs = 0;
 bool restoreFlywheelOff = false;
 
-char serialBuffer[SERIAL_BUFFER_SIZE];
+char serialBuffer[COMMAND_BUFFER_SIZE];
 size_t serialLength = 0;
 bool discardingSerialLine = false;
 
@@ -78,15 +78,6 @@ void setup() {
 
   pinMode(FLYWHEEL_PIN, OUTPUT);
   digitalWrite(FLYWHEEL_PIN, LOW);
-
-  // Allocate separate ESP32 PWM timers for predictable servo output.
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-
-  panServo.setPeriodHertz(50);
-  tiltServo.setPeriodHertz(50);
-  pusherServo.setPeriodHertz(50);
 
   panServo.attach(PAN_PIN, 500, 2500);
   tiltServo.attach(TILT_PIN, 500, 2500);
@@ -187,7 +178,7 @@ void handleSerial() {
           Serial.println("ERR: unknown command (H for help)");
           break;
       }
-    } else if (serialLength < SERIAL_BUFFER_SIZE - 1) {
+    } else if (serialLength < COMMAND_BUFFER_SIZE - 1) {
       serialBuffer[serialLength++] = incoming;
     } else {
       // Drop an overlong line, including bytes that arrive in a later loop.
