@@ -288,11 +288,11 @@ def main():
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--dry-run", action="store_true",
                     help="print aim commands instead of writing to serial")
-    ap.add_argument("--kp-pan", type=float, default=0.02, help="pan gain, deg/px")
-    ap.add_argument("--kp-tilt", type=float, default=0.02, help="tilt gain, deg/px")
+    ap.add_argument("--kp-pan", type=float, default=0.04, help="pan gain, deg/px")
+    ap.add_argument("--kp-tilt", type=float, default=0.04, help="tilt gain, deg/px")
     ap.add_argument("--max-step", type=float, default=5.0,
                     help="max degrees per control tick (speed cap)")
-    ap.add_argument("--move-cooldown", type=float, default=0.25,
+    ap.add_argument("--move-cooldown", type=float, default=0.125,
                     help="min seconds between move commands. keeps the turret "
                          "from machine-gunning steps at frame rate.")
     ap.add_argument("--wait-boot", type=float, default=2.0)
@@ -765,6 +765,11 @@ def main():
         should_stream = mjpeg is not None
         should_draw = (not args.no_preview and not gui_disabled) or should_save_debug or should_stream
         if should_draw:
+            # Black & white view: show the binarized darkness image instead of
+            # the camera picture. Anything past the dark threshold is black,
+            # everything else white — exactly what the detector "sees".
+            frame = cv2.cvtColor(cv2.bitwise_not(dark), cv2.COLOR_GRAY2BGR)
+
             # Draw rejected blobs in yellow with the reason so we can tune.
             for c, a, reason in rejected:
                 x, y, ww, hh = cv2.boundingRect(c)
