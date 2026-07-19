@@ -298,10 +298,15 @@ def main():
     ap.add_argument("--rev-time", type=float, default=0.2,
                     help="seconds the flywheels need to spin up after FIRE "
                          "before the first PUSH")
-    ap.add_argument("--shot-interval", type=float, default=2.0,
+    ap.add_argument("--shot-interval", type=float, default=10.0,
                     help="seconds between PUSH shots while locked on a target")
     ap.add_argument("--no-fire", action="store_true",
                     help="track only — never send FIRE/PUSH/STOP")
+    ap.add_argument("--always-rev", action="store_true",
+                    help="rev the flywheels once at startup and keep them "
+                         "spinning for the whole run instead of FIRE-on-acquire / "
+                         "STOP-on-lost. removes rev-up latency and FIRE/STOP spam; "
+                         "only PUSH is sent per target. STOP is still sent on exit.")
     ap.add_argument("--stop-grace", type=float, default=0.5,
                     help="seconds the target must stay gone before STOP is "
                          "sent. detection flickers frame to frame; without "
@@ -437,8 +442,15 @@ def main():
 
     # Firing sequence state: FIRE (rev up) on acquire, PUSH every
     # --shot-interval once revved, STOP when the target leaves the frame.
+    # With --always-rev we FIRE once up front (below) and never STOP mid-run,
+    # so the flywheels are always spun up and only PUSH is gated per target.
     revving = False
     rev_started_ts = 0.0
+    if args.always_rev and not args.no_fire:
+        sink.send("FIRE")
+        revving = True
+        rev_started_ts = time.monotonic()
+        print("[fire] FIRE — flywheels revving (always-rev)", flush=True)
     last_shot_ts = None
     shot_count = 0
     last_seen_ts = 0.0   # last frame with a detection, for --stop-grace
@@ -770,7 +782,8 @@ def main():
             # Grace period: detection drops out for a frame or two all the
             # time. Keep revving through those blips (no PUSHes happen while
             # undetected) and only STOP once the target is really gone.
-            if revving and ts - last_seen_ts >= args.stop_grace:
+            if (revving and not args.always_rev
+                    and ts - last_seen_ts >= args.stop_grace):
                 sink.send("STOP")
                 revving = False
                 print("[fire] STOP — target out of frame", flush=True)

@@ -15,7 +15,7 @@ class TrackerConfig:
     stale_seconds: float = 0.20     # drop target if no update within
     min_hits_to_fire: int = 4       # consecutive detections
     fire_tolerance_px: float = 30.0
-    fire_cooldown_s: float = 10.0
+    fire_cooldown_s: float = 0.35
     min_confidence: float = 0.15
 
 
