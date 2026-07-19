@@ -1,11 +1,9 @@
 """Buzzkill controller — runs on the RP5/QNX box.
 
 Reads target packets over UDP from detect.py and drives the turret over
-serial using arrow.sh's PAN:/TILT:/FIRE command set. Runs a proportional
-(P-only) controller per axis on the pixel error between the detected target
-and the frame center, capped at --max-step degrees per tick, and fires once
-the target sits within --tolerance-px of center on both axes — no STOP
-needed, the turret fires for ~1s on its own.
+serial using arrow.sh's PAN:/TILT: command set. Runs a proportional (P-only)
+controller per axis on the pixel error between the detected target and the
+frame center, capped at --max-step degrees per tick.
 
 Usage:
   python3 main.py --serial /dev/ser1 --port 9000
@@ -65,10 +63,6 @@ def main():
     ap.add_argument("--kp-tilt", type=float, default=0.08, help="tilt gain, deg/px")
     ap.add_argument("--max-step", type=float, default=20.0,
                     help="max degrees per control tick (speed cap)")
-    ap.add_argument("--tolerance-px", type=float, default=25.0,
-                    help="deadband radius counted as 'centered'")
-    ap.add_argument("--fire-cooldown", type=float, default=1.5,
-                    help="min seconds between FIRE commands")
     ap.add_argument("--hz", type=float, default=30.0, help="control loop rate")
     ap.add_argument("--wait-boot", type=float, default=2.0)
     args = ap.parse_args()
@@ -83,16 +77,19 @@ def main():
     rx = UdpReceiver(args.port)
     print(f"[main] listening on udp:{args.port}", flush=True)
 
-    last_fire = -1e9
+    had_target = False
     tick_dt = 1.0 / args.hz
     next_tick = time.monotonic()
 
     try:
         while not stop[0]:
             pkt = rx.poll()
-            now = time.monotonic()
 
             if pkt is not None and pkt.get("det"):
+                if not had_target:
+                    print("[main] target acquired", flush=True)
+                    had_target = True
+
                 fw = max(1, int(pkt.get("fw", 640)))
                 fh = max(1, int(pkt.get("fh", 480)))
                 cx, cy = fw / 2.0, fh / 2.0
@@ -101,17 +98,25 @@ def main():
 
                 # P-only per axis: output proportional to error, capped at max_step.
                 pan_step = clamp(args.kp_pan * ex, -args.max_step, args.max_step)
-                tilt_step = clamp(-args.kp_tilt * ey, -args.max_step, args.max_step)
+                tilt_step = clamp(args.kp_tilt * ey, -args.max_step, args.max_step)
 
+                moved = []
                 if abs(pan_step) >= 1:
                     sink.send(f"PAN:{int(round(pan_step))}")
+                    moved.append(f"PAN:{int(round(pan_step))}")
                 if abs(tilt_step) >= 1:
                     sink.send(f"TILT:{int(round(tilt_step))}")
+                    moved.append(f"TILT:{int(round(tilt_step))}")
 
-                centered = abs(ex) <= args.tolerance_px and abs(ey) <= args.tolerance_px
-                if centered and (now - last_fire) >= args.fire_cooldown:
-                    sink.send("FIRE")
-                    last_fire = now
+                if moved:
+                    print(f"[main] move sent: {' '.join(moved)}  "
+                          f"(ex={ex:+.1f} ey={ey:+.1f})", flush=True)
+                else:
+                    print(f"[main] no move — within deadband "
+                          f"(ex={ex:+.1f} ey={ey:+.1f})", flush=True)
+            elif had_target:
+                print("[main] target lost", flush=True)
+                had_target = False
 
             next_tick += tick_dt
             sleep = next_tick - time.monotonic()
