@@ -262,6 +262,9 @@ def main():
                     help="0 for CSI/webcam, or URL")
     ap.add_argument("--width",  type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
+    ap.add_argument("--zoom", type=float, default=2.0,
+                    help="center-crop factor (digital zoom). 2.0 keeps the "
+                         "middle half of the frame in each dimension. 1.0 = off.")
 
     # Auto-aim: P-only controller per axis, straight out over serial.
     ap.add_argument("--serial", default="/dev/ser1")
@@ -434,6 +437,15 @@ def main():
             continue
 
         frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+
+        # Digital zoom: keep the center 1/zoom of the frame in each dimension.
+        if args.zoom > 1.0:
+            fh0, fw0 = frame.shape[:2]
+            cw = max(1, int(fw0 / args.zoom))
+            ch = max(1, int(fh0 / args.zoom))
+            x0 = (fw0 - cw) // 2
+            y0 = (fh0 - ch) // 2
+            frame = frame[y0:y0 + ch, x0:x0 + cw]
 
         ts = time.monotonic()
         h, w = frame.shape[:2]
@@ -758,7 +770,7 @@ def main():
                         (10, 20), cv2.FONT_HERSHEY_SIMPLEX,
                         0.5, (0, 255, 255), 1)
             cv2.putText(frame, "T=capture template  C=clear  Q=quit",
-                        (10, args.height - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                        (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX,
                         0.4, (200, 200, 200), 1)
 
             # Compose mask visualization once — shared by show and save paths.
