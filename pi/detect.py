@@ -112,17 +112,29 @@ def clamp(value: float, lo: float, hi: float) -> float:
 
 class SerialSink:
     def __init__(self, dev: str, baud: int, wait_boot: float):
-        import serial  # pyserial
-
-        self._port = serial.Serial(dev, baud, timeout=0, write_timeout=0.5)
-        time.sleep(wait_boot)  # let the board finish any reset-on-open
         try:
-            self._port.reset_input_buffer()
-        except Exception:
-            pass
+            import serial  # pyserial
+            self._port = serial.Serial(dev, baud, timeout=0, write_timeout=0.5)
+            self._use_pyserial = True
+        except ImportError:
+            print(f"[detect] pyserial not found, falling back to direct file write for {dev}", flush=True)
+            self._port = open(dev, "wb", buffering=0)
+            self._use_pyserial = False
+
+        time.sleep(wait_boot)  # let the board finish any reset-on-open
+        if self._use_pyserial:
+            try:
+                self._port.reset_input_buffer()
+            except Exception:
+                pass
 
     def send(self, line: str) -> None:
         self._port.write((line + "\n").encode("ascii"))
+        if not self._use_pyserial:
+            try:
+                self._port.flush()
+            except Exception:
+                pass
 
     def close(self) -> None:
         try:
