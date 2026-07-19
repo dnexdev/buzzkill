@@ -359,6 +359,9 @@ def main():
             print("[detect] frame grab failed; retrying")
             time.sleep(0.05)
             continue
+
+        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+
         ts = time.monotonic()
         h, w = frame.shape[:2]
 
