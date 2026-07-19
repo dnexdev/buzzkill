@@ -699,7 +699,9 @@ def main():
             frame_cx, frame_cy = w / 2.0, h / 2.0
             ex = cx - frame_cx
             ey = cy - frame_cy
-            pan_step = clamp(args.kp_pan * ex, -args.max_step, args.max_step)
+            # Pan is negated: camera is mounted such that positive pixel error
+            # (target right of center) needs a negative pan command.
+            pan_step = clamp(args.kp_pan * -ex, -args.max_step, args.max_step)
             tilt_step = clamp(args.kp_tilt * ey, -args.max_step, args.max_step)
 
             if ts - last_move_ts >= args.move_cooldown:
