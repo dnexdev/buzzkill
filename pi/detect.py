@@ -295,6 +295,13 @@ def main():
     ap.add_argument("--move-cooldown", type=float, default=0.125,
                     help="min seconds between move commands. keeps the turret "
                          "from machine-gunning steps at frame rate.")
+    ap.add_argument("--rev-time", type=float, default=0.2,
+                    help="seconds the flywheels need to spin up after FIRE "
+                         "before the first PUSH")
+    ap.add_argument("--shot-interval", type=float, default=2.0,
+                    help="seconds between PUSH shots while locked on a target")
+    ap.add_argument("--no-fire", action="store_true",
+                    help="track only — never send FIRE/PUSH/STOP")
     ap.add_argument("--wait-boot", type=float, default=2.0)
     ap.add_argument("--min-confidence", type=float, default=0.0,
                     help="minimum target confidence to acquire aim. confidence "
@@ -422,6 +429,13 @@ def main():
     prev_centroids = []  # white-bg mode: candidate centroids from last frame
     had_target = False   # for aim acquired/lost logging
     last_move_ts = 0.0   # rate limiter for --move-cooldown
+
+    # Firing sequence state: FIRE (rev up) on acquire, PUSH every
+    # --shot-interval once revved, STOP when the target leaves the frame.
+    revving = False
+    rev_started_ts = 0.0
+    last_shot_ts = None
+    shot_count = 0
 
     fps_t0 = time.monotonic()
     fps_count = 0
@@ -720,6 +734,24 @@ def main():
                 else:
                     print(f"[aim] no move — within deadband "
                           f"(ex={ex:+.1f} ey={ey:+.1f})", flush=True)
+
+            # ---- firing sequence ----
+            # Rev on acquire; once spun up, one PUSH per --shot-interval for
+            # as long as we keep tracking the target.
+            if not args.no_fire:
+                if not revving:
+                    sink.send("FIRE")
+                    revving = True
+                    rev_started_ts = ts
+                    last_shot_ts = None
+                    print("[fire] FIRE — revving flywheels", flush=True)
+                elif ts - rev_started_ts >= args.rev_time and (
+                        last_shot_ts is None
+                        or ts - last_shot_ts >= args.shot_interval):
+                    sink.send("PUSH")
+                    last_shot_ts = ts
+                    shot_count += 1
+                    print(f"[fire] PUSH — shot {shot_count}", flush=True)
         else:
             lost_frames += 1
             if lost_frames > 5:
@@ -728,6 +760,10 @@ def main():
             if had_target:
                 print("[aim] target lost", flush=True)
                 had_target = False
+            if revving:
+                sink.send("STOP")
+                revving = False
+                print("[fire] STOP — target out of frame", flush=True)
 
         frame_count += 1
 
@@ -765,11 +801,6 @@ def main():
         should_stream = mjpeg is not None
         should_draw = (not args.no_preview and not gui_disabled) or should_save_debug or should_stream
         if should_draw:
-            # Black & white view: show the binarized darkness image instead of
-            # the camera picture. Anything past the dark threshold is black,
-            # everything else white — exactly what the detector "sees".
-            frame = cv2.cvtColor(cv2.bitwise_not(dark), cv2.COLOR_GRAY2BGR)
-
             # Draw rejected blobs in yellow with the reason so we can tune.
             for c, a, reason in rejected:
                 x, y, ww, hh = cv2.boundingRect(c)
@@ -851,6 +882,11 @@ def main():
                     template_contour = None
                     print("[detect] template cleared — matching disabled")
 
+    if revving:
+        try:
+            sink.send("STOP")
+        except Exception:
+            pass
     sink.close()
     cap.release()
     cv2.destroyAllWindows()
