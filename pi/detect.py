@@ -302,6 +302,11 @@ def main():
                     help="seconds between PUSH shots while locked on a target")
     ap.add_argument("--no-fire", action="store_true",
                     help="track only — never send FIRE/PUSH/STOP")
+    ap.add_argument("--stop-grace", type=float, default=0.5,
+                    help="seconds the target must stay gone before STOP is "
+                         "sent. detection flickers frame to frame; without "
+                         "this grace the flywheels get FIRE/STOP spam and "
+                         "never finish revving.")
     ap.add_argument("--wait-boot", type=float, default=2.0)
     ap.add_argument("--min-confidence", type=float, default=0.0,
                     help="minimum target confidence to acquire aim. confidence "
@@ -436,6 +441,7 @@ def main():
     rev_started_ts = 0.0
     last_shot_ts = None
     shot_count = 0
+    last_seen_ts = 0.0   # last frame with a detection, for --stop-grace
 
     fps_t0 = time.monotonic()
     fps_count = 0
@@ -701,6 +707,7 @@ def main():
             prev_pt = (cx, cy)
             prev_ts = ts
             lost_frames = 0
+            last_seen_ts = ts
 
             if not had_target:
                 print("[aim] target acquired", flush=True)
@@ -760,7 +767,10 @@ def main():
             if had_target:
                 print("[aim] target lost", flush=True)
                 had_target = False
-            if revving:
+            # Grace period: detection drops out for a frame or two all the
+            # time. Keep revving through those blips (no PUSHes happen while
+            # undetected) and only STOP once the target is really gone.
+            if revving and ts - last_seen_ts >= args.stop_grace:
                 sink.send("STOP")
                 revving = False
                 print("[fire] STOP — target out of frame", flush=True)
