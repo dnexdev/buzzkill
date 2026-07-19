@@ -112,14 +112,32 @@ def clamp(value: float, lo: float, hi: float) -> float:
 
 class SerialSink:
     def __init__(self, dev: str, baud: int, wait_boot: float):
-        import serial  # pyserial
-
-        self._port = serial.Serial(dev, baud, timeout=0, write_timeout=0.5)
-        time.sleep(wait_boot)  # let the board finish any reset-on-open
         try:
-            self._port.reset_input_buffer()
-        except Exception:
-            pass
+            import serial  # pyserial
+            self._port = serial.Serial(dev, baud, timeout=0, write_timeout=0.5)
+            self._use_pyserial = True
+        except ImportError:
+            # QNX has no pyserial. Set the baud rate with stty, then write
+            # straight to the device file.
+            print(f"[detect] pyserial not found — writing directly to {dev}",
+                  flush=True)
+            import subprocess
+            try:
+                with open(dev, "rb") as devfd:
+                    subprocess.run(["stty", f"baud={baud}"], stdin=devfd,
+                                   check=False)
+            except Exception as e:
+                print(f"[detect] stty baud set failed ({e}); "
+                      f"continuing with device defaults", flush=True)
+            self._port = open(dev, "wb", buffering=0)
+            self._use_pyserial = False
+
+        time.sleep(wait_boot)  # let the board finish any reset-on-open
+        if self._use_pyserial:
+            try:
+                self._port.reset_input_buffer()
+            except Exception:
+                pass
 
     def send(self, line: str) -> None:
         self._port.write((line + "\n").encode("ascii"))
