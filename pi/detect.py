@@ -17,11 +17,89 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import http.server
 import socket
+import socketserver
+import threading
 import time
 
 import cv2
 import numpy as np
+
+
+class MjpegServer:
+    """Serve the latest annotated frame as MJPEG so a browser on the laptop
+    can view what the (headless) Pi detector is seeing. Two endpoints:
+      /         landing page auto-loading /stream.mjpg
+      /stream.mjpg  multipart JPEG stream
+    """
+
+    def __init__(self, port: int):
+        self._port = port
+        self._latest_jpeg = None
+        self._cv = threading.Condition()
+        server = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                pass  # silence access log
+
+            def do_GET(self):
+                if self.path in ("/", "/index.html"):
+                    body = (
+                        b"<html><body style='margin:0;background:#111'>"
+                        b"<img src='/stream.mjpg' style='width:100%'/>"
+                        b"</body></html>")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if self.path.startswith("/stream"):
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     "multipart/x-mixed-replace; boundary=frame")
+                    self.end_headers()
+                    try:
+                        while True:
+                            with server._cv:
+                                server._cv.wait(timeout=1.0)
+                                jpg = server._latest_jpeg
+                            if jpg is None:
+                                continue
+                            self.wfile.write(b"--frame\r\n")
+                            self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                            self.wfile.write(
+                                f"Content-Length: {len(jpg)}\r\n\r\n".encode())
+                            self.wfile.write(jpg)
+                            self.wfile.write(b"\r\n")
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                    return
+                self.send_error(404)
+
+        class ThreadedServer(socketserver.ThreadingMixIn,
+                             http.server.HTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+        self._httpd = ThreadedServer(("0.0.0.0", port), Handler)
+        t = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        t.start()
+
+    def publish(self, frame_bgr):
+        ok, buf = cv2.imencode(".jpg", frame_bgr,
+                               [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if not ok:
+            return
+        with self._cv:
+            self._latest_jpeg = buf.tobytes()
+            self._cv.notify_all()
+
+    @property
+    def port(self):
+        return self._port
 
 from protocol import make_packet, encode
 
@@ -203,11 +281,20 @@ def main():
                          "to /tmp/buzzkill_frame.png and /tmp/buzzkill_mask.png. "
                          "scp these off the Pi to see what the detector sees. "
                          "0 = disabled.")
+    ap.add_argument("--stream-port", type=int, default=0, metavar="PORT",
+                    help="serve annotated frames as MJPEG over HTTP on this port. "
+                         "open http://<pi-ip>:PORT in a browser on your laptop. "
+                         "0 = disabled.")
     args = ap.parse_args()
 
     cap = open_camera(args.source, args.width, args.height)
     host, port = parse_hostport(args.target)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    mjpeg = None
+    if args.stream_port > 0:
+        mjpeg = MjpegServer(args.stream_port)
+        print(f"[detect] MJPEG stream on http://<pi-ip>:{args.stream_port}/")
 
     # Optional shape template — loaded at boot, replaced at runtime with T key.
     template_contour = None
@@ -523,7 +610,8 @@ def main():
 
         # Draw overlays if we're going to either display or save the frame.
         should_save_debug = args.save_debug > 0 and (pkt_count % args.save_debug == 0)
-        should_draw = (not args.no_preview and not gui_disabled) or should_save_debug
+        should_stream = mjpeg is not None
+        should_draw = (not args.no_preview and not gui_disabled) or should_save_debug or should_stream
         if should_draw:
             # Draw rejected blobs in yellow with the reason so we can tune.
             for c, a, reason in rejected:
@@ -579,6 +667,9 @@ def main():
                         cv2.imwrite("/tmp/buzzkill_mask.png", mask_viz)
                 except Exception as e:
                     print(f"[detect] imwrite failed: {e}")
+
+            if mjpeg is not None:
+                mjpeg.publish(frame)
 
             if not args.no_preview and not gui_disabled:
                 cv2.imshow("buzzkill detect", frame)
