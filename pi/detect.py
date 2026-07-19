@@ -1,4 +1,4 @@
-"""Motion + darkness detection pipeline. Sends target packets over UDP.
+"""Motion + darkness detection pipeline. Drives the turret directly.
 
 Optimized for the demo: black paper mosquitoes swinging on strings against
 a lighter background. The pipeline is:
@@ -9,16 +9,21 @@ The AND is the key trick: motion alone triggers on hands and walking people;
 darkness alone triggers on any dark object (a chair leg). Together they only
 fire when something dark is moving.
 
+Every processed frame that finds a target also runs a P-only controller per
+axis on the pixel error between the target and the frame center, capped at
+--max-step degrees, and sends the result straight out over serial.
+
 Usage:
   python3 detect.py --source 0
-  python3 detect.py --source 0 --target 192.168.1.42:9000
-  python3 detect.py --source 0 --show-mask       # tune the darkness threshold
+  python3 detect.py --source 0 --dry-run          # print aim commands, no serial
+  python3 detect.py --source 0 --serial /dev/ser1
+  python3 detect.py --source 0 --show-mask        # tune the darkness threshold
 """
 from __future__ import annotations
 
 import argparse
 import http.server
-import socket
+import signal
 import socketserver
 import threading
 import time
@@ -101,12 +106,37 @@ class MjpegServer:
     def port(self):
         return self._port
 
-from protocol import make_packet, encode
+def clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
 
 
-def parse_hostport(s: str):
-    host, port = s.rsplit(":", 1)
-    return host, int(port)
+class SerialSink:
+    def __init__(self, dev: str, baud: int, wait_boot: float):
+        import serial  # pyserial
+
+        self._port = serial.Serial(dev, baud, timeout=0, write_timeout=0.5)
+        time.sleep(wait_boot)  # let the board finish any reset-on-open
+        try:
+            self._port.reset_input_buffer()
+        except Exception:
+            pass
+
+    def send(self, line: str) -> None:
+        self._port.write((line + "\n").encode("ascii"))
+
+    def close(self) -> None:
+        try:
+            self._port.close()
+        except Exception:
+            pass
+
+
+class PrintSink:
+    def send(self, line: str) -> None:
+        print(f"[aim] > {line}", flush=True)
+
+    def close(self) -> None:
+        pass
 
 
 class CamsrcCapture:
@@ -212,10 +242,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", default="0",
                     help="0 for CSI/webcam, or URL")
-    ap.add_argument("--target", default="127.0.0.1:9000",
-                    help="host:port of the controller (main.py)")
     ap.add_argument("--width",  type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
+
+    # Auto-aim: P-only controller per axis, straight out over serial.
+    ap.add_argument("--serial", default="/dev/ser1")
+    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print aim commands instead of writing to serial")
+    ap.add_argument("--kp-pan", type=float, default=0.08, help="pan gain, deg/px")
+    ap.add_argument("--kp-tilt", type=float, default=0.08, help="tilt gain, deg/px")
+    ap.add_argument("--max-step", type=float, default=20.0,
+                    help="max degrees per control tick (speed cap)")
+    ap.add_argument("--wait-boot", type=float, default=2.0)
 
     # Tuned defaults for the demo (black mosquitoes on white background).
     # Loose enough to catch small (far away) and blurred (moving) mosquitoes.
@@ -287,9 +326,14 @@ def main():
                          "0 = disabled.")
     args = ap.parse_args()
 
+    stop = [False]
+    def on_sigint(*_):
+        stop[0] = True
+    signal.signal(signal.SIGINT, on_sigint)
+    signal.signal(signal.SIGTERM, on_sigint)
+
     cap = open_camera(args.source, args.width, args.height)
-    host, port = parse_hostport(args.target)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sink = PrintSink() if args.dry_run else SerialSink(args.serial, args.baud, args.wait_boot)
 
     mjpeg = None
     if args.stream_port > 0:
@@ -327,11 +371,12 @@ def main():
     prev_ts = None
     lost_frames = 0
     prev_centroids = []  # white-bg mode: candidate centroids from last frame
+    had_target = False   # for aim acquired/lost logging
 
     fps_t0 = time.monotonic()
     fps_count = 0
     fps = 0.0
-    pkt_count = 0
+    frame_count = 0
 
     from collections import Counter
     debug_t0 = time.monotonic()
@@ -351,9 +396,10 @@ def main():
             print(f"[detect] cv2.imshow unavailable ({str(e).splitlines()[0][:80]}...) — running headless")
             gui_disabled = True
 
-    print(f"[detect] {args.width}x{args.height} → udp {host}:{port}. press q to quit.")
+    aim_target = "dry-run" if args.dry_run else args.serial
+    print(f"[detect] {args.width}x{args.height} → {aim_target}. press q to quit.")
 
-    while True:
+    while not stop[0]:
         ok, frame = cap.read()
         if not ok:
             print("[detect] frame grab failed; retrying")
@@ -571,16 +617,43 @@ def main():
             prev_pt = (cx, cy)
             prev_ts = ts
             lost_frames = 0
-            pkt = make_packet(w, h, cx, cy, vx, vy, confidence, True)
+
+            if not had_target:
+                print("[aim] target acquired", flush=True)
+                had_target = True
+
+            # P-only per axis: output proportional to pixel error from frame
+            # center, capped at max_step.
+            frame_cx, frame_cy = w / 2.0, h / 2.0
+            ex = cx - frame_cx
+            ey = cy - frame_cy
+            pan_step = clamp(args.kp_pan * ex, -args.max_step, args.max_step)
+            tilt_step = clamp(args.kp_tilt * ey, -args.max_step, args.max_step)
+
+            moved = []
+            if abs(pan_step) >= 1:
+                sink.send(f"PAN:{int(round(pan_step))}")
+                moved.append(f"PAN:{int(round(pan_step))}")
+            if abs(tilt_step) >= 1:
+                sink.send(f"TILT:{int(round(tilt_step))}")
+                moved.append(f"TILT:{int(round(tilt_step))}")
+
+            if moved:
+                print(f"[aim] move sent: {' '.join(moved)}  "
+                      f"(ex={ex:+.1f} ey={ey:+.1f})", flush=True)
+            else:
+                print(f"[aim] no move — within deadband "
+                      f"(ex={ex:+.1f} ey={ey:+.1f})", flush=True)
         else:
             lost_frames += 1
             if lost_frames > 5:
                 prev_pt = None
                 prev_ts = None
-            pkt = make_packet(w, h, -1, -1, 0, 0, 0, False)
+            if had_target:
+                print("[aim] target lost", flush=True)
+                had_target = False
 
-        sock.sendto(encode(pkt), (host, port))
-        pkt_count += 1
+        frame_count += 1
 
         # --- FPS counter ---
         fps_count += 1
@@ -612,7 +685,7 @@ def main():
                 debug_t0 = ts
 
         # Draw overlays if we're going to either display or save the frame.
-        should_save_debug = args.save_debug > 0 and (pkt_count % args.save_debug == 0)
+        should_save_debug = args.save_debug > 0 and (frame_count % args.save_debug == 0)
         should_stream = mjpeg is not None
         should_draw = (not args.no_preview and not gui_disabled) or should_save_debug or should_stream
         if should_draw:
@@ -696,6 +769,7 @@ def main():
                     template_contour = None
                     print("[detect] template cleared — matching disabled")
 
+    sink.close()
     cap.release()
     cv2.destroyAllWindows()
 

@@ -10,8 +10,7 @@ Nerf turret that shoots swinging paper mosquitoes. Hack the 6ix 2026.
      │
      ▼
 [RP5 running QNX]
-  ├── detect.py    OpenCV motion detection, emits UDP target packets
-  └── main.py      tracker (EMA + lead prediction), fire control, serial to ESP32
+  detect.py   OpenCV motion detection → P-controller per axis → serial to ESP32
                                                                        │
                                                                        ▼
                                                                   [ESP32]
@@ -25,14 +24,11 @@ Everything runs on the Pi. The ESP32 is a dumb executor for servo PWM and firing
 
 ```
 pi/                 all Python — runs on the RP5/QNX box
-├── detect.py       OpenCV pipeline (camera → UDP)
-├── main.py         controller (UDP → tracker → serial)
+├── detect.py       OpenCV pipeline (camera → P-controller → serial), the run file
 ├── tracker.py      EMA smoothing + lead prediction + fire decision
-├── receiver.py     non-blocking UDP
 ├── servo.py        MockServo / SerialServo (talks to ESP32 sketch)
 ├── calibration.py  4-corner bilinear pixel→angle map
 ├── calibrate.py    interactive calibration tool
-├── protocol.py     UDP packet schema
 ├── config/calibration.json
 └── requirements.txt
 
@@ -53,32 +49,26 @@ python3 -c "import cv2; c=cv2.VideoCapture(0); ok,_=c.read(); print(ok)"
 
 ## Run
 
-Two terminals on the Pi:
+One terminal on the Pi:
 
 ```
-# Terminal A — controller
 cd pi
-python3 main.py --serial /dev/serUSB0
-
-# Terminal B — vision
-cd pi
-python3 detect.py --source 0 --target 127.0.0.1:9000
+python3 detect.py --source 0 --serial /dev/serUSB0
 ```
 
-Wave a hand or swing a paper mosquito. The controller prints aim commands
-and fires when the target is stable and lead-corrected.
+Wave a hand or swing a paper mosquito. detect.py prints aim commands as it
+sends them.
 
 ## Dev on a laptop (no Pi needed)
 
 ```
 cd pi
 pip install -r requirements.txt
-python3 main.py --mock --port 9000                       # terminal A
-python3 detect.py --source 0 --target 127.0.0.1:9000     # terminal B
+python3 detect.py --source 0 --dry-run
 ```
 
-Mock servo prints commands to stdout so you can validate the whole pipeline
-without hardware.
+`--dry-run` prints aim commands to stdout instead of writing to serial, so
+you can validate the whole pipeline without hardware.
 
 ## Calibrate
 
@@ -89,7 +79,7 @@ python3 calibrate.py --source 0 --out config/calibration.json
 ```
 
 Aim the turret at each frame corner, click that point, enter the pan/tilt
-angles you dialed. `main.py` loads this at startup.
+angles you dialed.
 
 ## Tuning
 
