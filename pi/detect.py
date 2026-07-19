@@ -276,8 +276,11 @@ def main():
                     help="min seconds between move commands. keeps the turret "
                          "from machine-gunning steps at frame rate.")
     ap.add_argument("--wait-boot", type=float, default=2.0)
-    ap.add_argument("--min-confidence", type=float, default=0.5,
-                    help="minimum target confidence to acquire aim (default: 0.5)")
+    ap.add_argument("--min-confidence", type=float, default=0.15,
+                    help="minimum target confidence to acquire aim. confidence "
+                         "is a product of four 0-1 scores (dark, white ring, "
+                         "contrast, fill), so real targets score ~0.2-0.45; "
+                         "0.5 rejects nearly everything. 0 disables the gate.")
 
     # Tuned defaults for the demo (black mosquitoes on white background).
     # Loose enough to catch small (far away) and blurred (moving) mosquitoes.
