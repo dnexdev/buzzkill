@@ -262,7 +262,7 @@ def main():
                     help="0 for CSI/webcam, or URL")
     ap.add_argument("--width",  type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--zoom", type=float, default=2.0,
+    ap.add_argument("--zoom", type=float, default=1.0,
                     help="center-crop factor (digital zoom). 2.0 keeps the "
                          "middle half of the frame in each dimension. 1.0 = off.")
 
@@ -781,6 +781,7 @@ def main():
                 colored[..., 0] = dark                # B = dark
                 combined3 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
                 mask_viz = cv2.addWeighted(colored, 0.7, combined3, 0.5, 0)
+
 
             if should_save_debug:
                 try:
