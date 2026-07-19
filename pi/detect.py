@@ -267,13 +267,6 @@ def main():
                     help="0 for CSI/webcam, or URL")
     ap.add_argument("--width",  type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--cap-width", type=int, default=2304,
-                    help="resolution requested from the camera. small modes on "
-                         "CSI cameras are sensor center-crops (zoomed in); "
-                         "2304x1296 is the Pi Cam 3 full-FOV binned mode. "
-                         "frames are scaled down to --width for processing. "
-                         "0 = request --width/--height directly.")
-    ap.add_argument("--cap-height", type=int, default=1296)
     ap.add_argument("--zoom", type=float, default=1.0,
                     help="center-crop factor (digital zoom). 2.0 keeps the "
                          "middle half of the frame in each dimension. 1.0 = off.")
@@ -373,9 +366,7 @@ def main():
     signal.signal(signal.SIGINT, on_sigint)
     signal.signal(signal.SIGTERM, on_sigint)
 
-    cap_w = args.cap_width if args.cap_width > 0 else args.width
-    cap_h = args.cap_height if args.cap_height > 0 else args.height
-    cap = open_camera(args.source, cap_w, cap_h)
+    cap = open_camera(args.source, args.width, args.height)
     sink = PrintSink() if args.dry_run else SerialSink(args.serial, args.baud, args.wait_boot)
 
     mjpeg = None
@@ -449,14 +440,6 @@ def main():
             print("[detect] frame grab failed; retrying")
             time.sleep(0.05)
             continue
-
-        # Scale the (possibly much larger) capture down to processing size.
-        # Keeps aspect: width becomes --width, height follows.
-        fh0, fw0 = frame.shape[:2]
-        if fw0 > args.width:
-            scale = args.width / fw0
-            frame = cv2.resize(frame, (args.width, max(1, int(fh0 * scale))),
-                               interpolation=cv2.INTER_AREA)
 
         frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 
