@@ -112,29 +112,17 @@ def clamp(value: float, lo: float, hi: float) -> float:
 
 class SerialSink:
     def __init__(self, dev: str, baud: int, wait_boot: float):
-        try:
-            import serial  # pyserial
-            self._port = serial.Serial(dev, baud, timeout=0, write_timeout=0.5)
-            self._use_pyserial = True
-        except ImportError:
-            print(f"[detect] pyserial not found, falling back to direct file write for {dev}", flush=True)
-            self._port = open(dev, "wb", buffering=0)
-            self._use_pyserial = False
+        import serial  # pyserial
 
+        self._port = serial.Serial(dev, baud, timeout=0, write_timeout=0.5)
         time.sleep(wait_boot)  # let the board finish any reset-on-open
-        if self._use_pyserial:
-            try:
-                self._port.reset_input_buffer()
-            except Exception:
-                pass
+        try:
+            self._port.reset_input_buffer()
+        except Exception:
+            pass
 
     def send(self, line: str) -> None:
         self._port.write((line + "\n").encode("ascii"))
-        if not self._use_pyserial:
-            try:
-                self._port.flush()
-            except Exception:
-                pass
 
     def close(self) -> None:
         try:
@@ -262,11 +250,16 @@ def main():
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--dry-run", action="store_true",
                     help="print aim commands instead of writing to serial")
-    ap.add_argument("--kp-pan", type=float, default=0.08, help="pan gain, deg/px")
-    ap.add_argument("--kp-tilt", type=float, default=0.08, help="tilt gain, deg/px")
-    ap.add_argument("--max-step", type=float, default=20.0,
+    ap.add_argument("--kp-pan", type=float, default=0.02, help="pan gain, deg/px")
+    ap.add_argument("--kp-tilt", type=float, default=0.02, help="tilt gain, deg/px")
+    ap.add_argument("--max-step", type=float, default=5.0,
                     help="max degrees per control tick (speed cap)")
+    ap.add_argument("--move-cooldown", type=float, default=0.25,
+                    help="min seconds between move commands. keeps the turret "
+                         "from machine-gunning steps at frame rate.")
     ap.add_argument("--wait-boot", type=float, default=2.0)
+    ap.add_argument("--min-confidence", type=float, default=0.5,
+                    help="minimum target confidence to acquire aim (default: 0.5)")
 
     # Tuned defaults for the demo (black mosquitoes on white background).
     # Loose enough to catch small (far away) and blurred (moving) mosquitoes.
@@ -384,6 +377,7 @@ def main():
     lost_frames = 0
     prev_centroids = []  # white-bg mode: candidate centroids from last frame
     had_target = False   # for aim acquired/lost logging
+    last_move_ts = 0.0   # rate limiter for --move-cooldown
 
     fps_t0 = time.monotonic()
     fps_count = 0
@@ -614,7 +608,10 @@ def main():
                     best_area = a
                     cx, cy = ccx, ccy
                     confidence = cf
-            detected = True
+            if best_conf >= args.min_confidence:
+                detected = True
+            else:
+                best = None
 
         # Remember every valid centroid for next frame's white-bg tracking.
         prev_centroids = [(ccx, ccy) for _, _, ccx, ccy, _ in candidates]
@@ -635,27 +632,31 @@ def main():
                 had_target = True
 
             # P-only per axis: output proportional to pixel error from frame
-            # center, capped at max_step.
+            # center, capped at max_step. Moves are also rate-limited by
+            # --move-cooldown so the servos step gently instead of jittering
+            # at frame rate.
             frame_cx, frame_cy = w / 2.0, h / 2.0
             ex = cx - frame_cx
             ey = cy - frame_cy
             pan_step = clamp(args.kp_pan * ex, -args.max_step, args.max_step)
             tilt_step = clamp(args.kp_tilt * ey, -args.max_step, args.max_step)
 
-            moved = []
-            if abs(pan_step) >= 1:
-                sink.send(f"PAN:{int(round(pan_step))}")
-                moved.append(f"PAN:{int(round(pan_step))}")
-            if abs(tilt_step) >= 1:
-                sink.send(f"TILT:{int(round(tilt_step))}")
-                moved.append(f"TILT:{int(round(tilt_step))}")
+            if ts - last_move_ts >= args.move_cooldown:
+                moved = []
+                if abs(pan_step) >= 1:
+                    sink.send(f"PAN:{int(round(pan_step))}")
+                    moved.append(f"PAN:{int(round(pan_step))}")
+                if abs(tilt_step) >= 1:
+                    sink.send(f"TILT:{int(round(tilt_step))}")
+                    moved.append(f"TILT:{int(round(tilt_step))}")
 
-            if moved:
-                print(f"[aim] move sent: {' '.join(moved)}  "
-                      f"(ex={ex:+.1f} ey={ey:+.1f})", flush=True)
-            else:
-                print(f"[aim] no move — within deadband "
-                      f"(ex={ex:+.1f} ey={ey:+.1f})", flush=True)
+                if moved:
+                    last_move_ts = ts
+                    print(f"[aim] move sent: {' '.join(moved)}  "
+                          f"(ex={ex:+.1f} ey={ey:+.1f})", flush=True)
+                else:
+                    print(f"[aim] no move — within deadband "
+                          f"(ex={ex:+.1f} ey={ey:+.1f})", flush=True)
         else:
             lost_frames += 1
             if lost_frames > 5:

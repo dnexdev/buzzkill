@@ -41,7 +41,6 @@ def main():
     ok, frame = cap.read()
     if not ok:
         raise SystemExit("could not grab initial frame")
-    frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     h, w = frame.shape[:2]
 
     points = []
@@ -61,7 +60,6 @@ def main():
             ok, frame = cap.read()
             if not ok:
                 continue
-            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
             for p in points:
                 cv2.circle(frame, (int(p["px"]), int(p["py"])),
                            6, (0, 255, 0), 2)
