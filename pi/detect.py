@@ -295,23 +295,26 @@ def main():
     ap.add_argument("--move-cooldown", type=float, default=0.125,
                     help="min seconds between move commands. keeps the turret "
                          "from machine-gunning steps at frame rate.")
-    ap.add_argument("--rev-time", type=float, default=0.2,
-                    help="seconds the flywheels need to spin up after FIRE "
-                         "before the first PUSH")
+    ap.add_argument("--rev-time", type=float, default=1.0,
+                    help="seconds the flywheels must spin up after FIRE before "
+                         "the first PUSH. the turret keeps tracking the target "
+                         "through this window and only fires once at least this "
+                         "long has elapsed, so shots leave at full speed.")
     ap.add_argument("--shot-interval", type=float, default=10.0,
                     help="seconds between PUSH shots while locked on a target")
     ap.add_argument("--no-fire", action="store_true",
                     help="track only — never send FIRE/PUSH/STOP")
     ap.add_argument("--always-rev", action="store_true",
-                    help="rev the flywheels once at startup and keep them "
-                         "spinning for the whole run instead of FIRE-on-acquire / "
-                         "STOP-on-lost. removes rev-up latency and FIRE/STOP spam; "
-                         "only PUSH is sent per target. STOP is still sent on exit.")
-    ap.add_argument("--stop-grace", type=float, default=0.5,
-                    help="seconds the target must stay gone before STOP is "
-                         "sent. detection flickers frame to frame; without "
-                         "this grace the flywheels get FIRE/STOP spam and "
-                         "never finish revving.")
+                    help="never spin the flywheels down mid-run: ignore the "
+                         "--stop-grace idle stop and keep them revved until the "
+                         "script exits. the flywheels rev at startup either way; "
+                         "STOP is still sent on exit.")
+    ap.add_argument("--stop-grace", type=float, default=5.0,
+                    help="seconds the target must stay gone before STOP spins "
+                         "the flywheels down. detection flickers frame to "
+                         "frame, so this grace keeps a brief loss of contact "
+                         "from stopping the flywheels; they only stop after a "
+                         "sustained absence.")
     ap.add_argument("--wait-boot", type=float, default=2.0)
     ap.add_argument("--min-confidence", type=float, default=0.0,
                     help="minimum target confidence to acquire aim. confidence "
@@ -440,20 +443,28 @@ def main():
     had_target = False   # for aim acquired/lost logging
     last_move_ts = 0.0   # rate limiter for --move-cooldown
 
-    # Firing sequence state: FIRE (rev up) on acquire, PUSH every
-    # --shot-interval once revved, STOP when the target leaves the frame.
-    # With --always-rev we FIRE once up front (below) and never STOP mid-run,
-    # so the flywheels are always spun up and only PUSH is gated per target.
+    # Firing sequence state. The flywheels are revved up front and kept
+    # spinning: brief detection dropouts hold the rev, and they only spin
+    # down after --stop-grace seconds with no target at all (never, under
+    # --always-rev). PUSH is sent only once the flywheels are confidently up
+    # to speed (--rev-time after the FIRE) and never while stopped; a target
+    # reappearing after a STOP re-revs before any shot.
     revving = False
-    rev_started_ts = 0.0
-    if args.always_rev and not args.no_fire:
+    if not args.no_fire:
         sink.send("FIRE")
         revving = True
-        rev_started_ts = time.monotonic()
-        print("[fire] FIRE — flywheels revving (always-rev)", flush=True)
+        tag = " (always-rev)" if args.always_rev else ""
+        print(f"[fire] FIRE — flywheels revving{tag}", flush=True)
     last_shot_ts = None
     shot_count = 0
-    last_seen_ts = 0.0   # last frame with a detection, for --stop-grace
+    # When the current target was first acquired. The first PUSH waits
+    # --rev-time after this, so a freshly acquired target is tracked (and the
+    # flywheels kept spinning) for that long before any shot. None = no target
+    # engaged right now.
+    acquired_ts = None
+    # Seed the grace clock at startup so the initial rev isn't stopped before
+    # the first target ever appears.
+    last_seen_ts = time.monotonic()   # last frame with a detection, for --stop-grace
 
     fps_t0 = time.monotonic()
     fps_count = 0
@@ -719,6 +730,13 @@ def main():
             prev_pt = (cx, cy)
             prev_ts = ts
             lost_frames = 0
+            # Start the pre-fire tracking window on a genuine acquisition: the
+            # first target ever, or one that had been gone longer than
+            # --stop-grace (a real re-acquire, not a frame-to-frame flicker).
+            # Brief dropouts keep the existing window so the countdown to the
+            # first shot isn't restarted every time detection blinks.
+            if acquired_ts is None or ts - last_seen_ts > args.stop_grace:
+                acquired_ts = ts
             last_seen_ts = ts
 
             if not had_target:
@@ -755,16 +773,20 @@ def main():
                           f"(ex={ex:+.1f} ey={ey:+.1f})", flush=True)
 
             # ---- firing sequence ----
-            # Rev on acquire; once spun up, one PUSH per --shot-interval for
-            # as long as we keep tracking the target.
+            # Flywheels are normally already revved (spun up at startup and
+            # held through brief losses). If a prior STOP spun them down,
+            # re-rev now and take no shot this frame. Otherwise hold fire until
+            # the target has been tracked for --rev-time since acquisition — the
+            # turret keeps aiming during that window, and the flywheels are
+            # guaranteed spun up by the time it elapses — then one PUSH per
+            # --shot-interval for as long as we keep tracking.
             if not args.no_fire:
                 if not revving:
                     sink.send("FIRE")
                     revving = True
-                    rev_started_ts = ts
                     last_shot_ts = None
-                    print("[fire] FIRE — revving flywheels", flush=True)
-                elif ts - rev_started_ts >= args.rev_time and (
+                    print("[fire] FIRE — re-revving flywheels", flush=True)
+                elif ts - acquired_ts >= args.rev_time and (
                         last_shot_ts is None
                         or ts - last_shot_ts >= args.shot_interval):
                     sink.send("PUSH")
@@ -780,13 +802,15 @@ def main():
                 print("[aim] target lost", flush=True)
                 had_target = False
             # Grace period: detection drops out for a frame or two all the
-            # time. Keep revving through those blips (no PUSHes happen while
-            # undetected) and only STOP once the target is really gone.
+            # time. Hold the rev through those blips (no PUSHes happen while
+            # undetected) and only STOP once the target has been gone for a
+            # sustained --stop-grace seconds, so a brief loss of contact never
+            # spins the flywheels down.
             if (revving and not args.always_rev
                     and ts - last_seen_ts >= args.stop_grace):
                 sink.send("STOP")
                 revving = False
-                print("[fire] STOP — target out of frame", flush=True)
+                print("[fire] STOP — target gone", flush=True)
 
         frame_count += 1
 
