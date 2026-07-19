@@ -1,34 +1,76 @@
 """Buzzkill controller — runs on the RP5/QNX box.
 
-Reads target packets over UDP from detect.py, smooths them, predicts lead,
-maps pixels to servo angles, and drives the ESP32 turret over serial.
+Reads target packets over UDP from detect.py and drives the turret over
+serial using arrow.sh's PAN:/TILT:/FIRE command set. Runs a proportional
+(P-only) controller per axis on the pixel error between the detected target
+and the frame center, capped at --max-step degrees per tick, and fires once
+the target sits within --tolerance-px of center on both axes — no STOP
+needed, the turret fires for ~1s on its own.
 
 Usage:
-  python3 main.py --mock --port 9000
-  python3 main.py --serial /dev/serUSB0 --calib config/calibration.json
+  python3 main.py --serial /dev/ser1 --port 9000
+  python3 main.py --dry-run --port 9000   # print commands, no serial
 """
 from __future__ import annotations
 
 import argparse
 import signal
-import sys
 import time
 
-from calibration import Calibration
 from receiver import UdpReceiver
-from servo import MockServo, SerialServo
-from tracker import Tracker
+
+
+def clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+class SerialSink:
+    def __init__(self, dev: str, baud: int, wait_boot: float):
+        import serial  # pyserial
+
+        self._port = serial.Serial(dev, baud, timeout=0, write_timeout=0.5)
+        time.sleep(wait_boot)  # let the board finish any reset-on-open
+        try:
+            self._port.reset_input_buffer()
+        except Exception:
+            pass
+
+    def send(self, line: str) -> None:
+        self._port.write((line + "\n").encode("ascii"))
+
+    def close(self) -> None:
+        try:
+            self._port.close()
+        except Exception:
+            pass
+
+
+class PrintSink:
+    def send(self, line: str) -> None:
+        print(f"[main] > {line}", flush=True)
+
+    def close(self) -> None:
+        pass
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mock", action="store_true", help="print servo commands instead of talking to ESP32")
-    ap.add_argument("--port", type=int, default=9000)
-    ap.add_argument("--serial", default="/dev/serUSB0")
+    ap.add_argument("--port", type=int, default=9000,
+                    help="UDP port detect.py sends target packets to")
+    ap.add_argument("--serial", default="/dev/ser1")
     ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--calib", default="config/calibration.json")
-    ap.add_argument("--hz", type=float, default=50.0)
-    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print commands instead of writing to serial")
+    ap.add_argument("--kp-pan", type=float, default=0.08, help="pan gain, deg/px")
+    ap.add_argument("--kp-tilt", type=float, default=0.08, help="tilt gain, deg/px")
+    ap.add_argument("--max-step", type=float, default=20.0,
+                    help="max degrees per control tick (speed cap)")
+    ap.add_argument("--tolerance-px", type=float, default=25.0,
+                    help="deadband radius counted as 'centered'")
+    ap.add_argument("--fire-cooldown", type=float, default=1.5,
+                    help="min seconds between FIRE commands")
+    ap.add_argument("--hz", type=float, default=30.0, help="control loop rate")
+    ap.add_argument("--wait-boot", type=float, default=2.0)
     args = ap.parse_args()
 
     stop = [False]
@@ -37,64 +79,39 @@ def main():
     signal.signal(signal.SIGINT, on_sigint)
     signal.signal(signal.SIGTERM, on_sigint)
 
+    sink = PrintSink() if args.dry_run else SerialSink(args.serial, args.baud, args.wait_boot)
     rx = UdpReceiver(args.port)
     print(f"[main] listening on udp:{args.port}", flush=True)
 
-    try:
-        calib = Calibration.load(args.calib)
-        print(f"[main] loaded {args.calib} ({calib.frame_w}x{calib.frame_h})", flush=True)
-    except Exception as e:
-        print(f"[main] no calibration: {e}. using default ±30° span.", flush=True)
-        calib = Calibration()
-
-    if args.mock:
-        servo = MockServo()
-        print("[main] servo: mock", flush=True)
-    else:
-        try:
-            servo = SerialServo(args.serial, args.baud)
-            print(f"[main] servo: esp32 on {args.serial}", flush=True)
-        except Exception as e:
-            print(f"[main] serial open failed ({e}); falling back to mock", flush=True)
-            servo = MockServo()
-    servo.arm()
-
-    tracker = Tracker()
-
+    last_fire = -1e9
     tick_dt = 1.0 / args.hz
     next_tick = time.monotonic()
-    last_pkt_t = 0.0
-    have_target_at_all = False
-    stats = {"pkts": 0, "fires": 0}
-    next_log = time.monotonic() + 1.0
 
     try:
         while not stop[0]:
             pkt = rx.poll()
             now = time.monotonic()
-            if pkt is not None:
-                stats["pkts"] += 1
-                last_pkt_t = now
-                tracker.update(pkt, now)
-                have_target_at_all = True
 
-            aim = tracker.aim_point(now)
-            if aim is not None:
-                px, py = aim
-                pan, tilt = calib.pixel_to_angles(px, py)
-                servo.aim(pan, tilt)
-                if tracker.should_fire(now):
-                    servo.fire()
-                    stats["fires"] += 1
-            elif have_target_at_all and now - last_pkt_t > 1.0:
-                # No packets for a full second — stop flywheels, hold position.
-                servo.spin(False)
-                have_target_at_all = False
+            if pkt is not None and pkt.get("det"):
+                fw = max(1, int(pkt.get("fw", 640)))
+                fh = max(1, int(pkt.get("fh", 480)))
+                cx, cy = fw / 2.0, fh / 2.0
+                ex = float(pkt["x"]) - cx
+                ey = float(pkt["y"]) - cy
 
-            if args.verbose and now >= next_log:
-                print(f"[main] pkts={stats['pkts']}/s fires={stats['fires']}", flush=True)
-                stats["pkts"] = stats["fires"] = 0
-                next_log = now + 1.0
+                # P-only per axis: output proportional to error, capped at max_step.
+                pan_step = clamp(args.kp_pan * ex, -args.max_step, args.max_step)
+                tilt_step = clamp(-args.kp_tilt * ey, -args.max_step, args.max_step)
+
+                if abs(pan_step) >= 1:
+                    sink.send(f"PAN:{int(round(pan_step))}")
+                if abs(tilt_step) >= 1:
+                    sink.send(f"TILT:{int(round(tilt_step))}")
+
+                centered = abs(ex) <= args.tolerance_px and abs(ey) <= args.tolerance_px
+                if centered and (now - last_fire) >= args.fire_cooldown:
+                    sink.send("FIRE")
+                    last_fire = now
 
             next_tick += tick_dt
             sleep = next_tick - time.monotonic()
@@ -103,7 +120,7 @@ def main():
             else:
                 next_tick = time.monotonic()  # fell behind, resync
     finally:
-        servo.close()
+        sink.close()
         rx.close()
         print("\n[main] bye", flush=True)
 
