@@ -198,6 +198,11 @@ def main():
     ap.add_argument("--debug", action="store_true",
                     help="print detection stats and rejection reasons every 2s. "
                          "essential when running headless (no cv2.imshow).")
+    ap.add_argument("--save-debug", type=int, default=0, metavar="N",
+                    help="every N frames, save the current annotated frame and mask "
+                         "to /tmp/buzzkill_frame.png and /tmp/buzzkill_mask.png. "
+                         "scp these off the Pi to see what the detector sees. "
+                         "0 = disabled.")
     args = ap.parse_args()
 
     cap = open_camera(args.source, args.width, args.height)
@@ -516,7 +521,10 @@ def main():
                 debug_reject_reasons.clear()
                 debug_t0 = ts
 
-        if not args.no_preview and not gui_disabled:
+        # Draw overlays if we're going to either display or save the frame.
+        should_save_debug = args.save_debug > 0 and (pkt_count % args.save_debug == 0)
+        should_draw = (not args.no_preview and not gui_disabled) or should_save_debug
+        if should_draw:
             # Draw rejected blobs in yellow with the reason so we can tune.
             for c, a, reason in rejected:
                 x, y, ww, hh = cv2.boundingRect(c)
@@ -555,34 +563,44 @@ def main():
                         (10, args.height - 10), cv2.FONT_HERSHEY_SIMPLEX,
                         0.4, (200, 200, 200), 1)
 
-            cv2.imshow("buzzkill detect", frame)
-
-            if args.show_mask:
-                # Colorize: red = motion only, blue = dark only, white = both (target).
+            # Compose mask visualization once — shared by show and save paths.
+            mask_viz = None
+            if args.show_mask or should_save_debug:
                 colored = np.zeros_like(frame)
-                colored[..., 2] = motion              # R channel = motion
-                colored[..., 0] = dark                # B channel = dark
+                colored[..., 2] = motion              # R = motion
+                colored[..., 0] = dark                # B = dark
                 combined3 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-                cv2.imshow("mask (R=motion B=dark W=both)",
-                           cv2.addWeighted(colored, 0.7, combined3, 0.5, 0))
+                mask_viz = cv2.addWeighted(colored, 0.7, combined3, 0.5, 0)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == 0xFF:  # nothing pressed
-                pass
-            elif key == ord("q"):
-                break
-            elif key == ord("t") and best is not None:
-                # Capture the currently-locked target's contour as the template.
-                template_contour = best.copy()
+            if should_save_debug:
                 try:
-                    np.save(args.template, template_contour, allow_pickle=False)
-                    print(f"[detect] template captured "
-                          f"({len(template_contour)} points) → {args.template}")
+                    cv2.imwrite("/tmp/buzzkill_frame.png", frame)
+                    if mask_viz is not None:
+                        cv2.imwrite("/tmp/buzzkill_mask.png", mask_viz)
                 except Exception as e:
-                    print(f"[detect] template save failed: {e}")
-            elif key == ord("c"):
-                template_contour = None
-                print("[detect] template cleared — matching disabled")
+                    print(f"[detect] imwrite failed: {e}")
+
+            if not args.no_preview and not gui_disabled:
+                cv2.imshow("buzzkill detect", frame)
+                if args.show_mask and mask_viz is not None:
+                    cv2.imshow("mask (R=motion B=dark W=both)", mask_viz)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == 0xFF:  # nothing pressed
+                    pass
+                elif key == ord("q"):
+                    break
+                elif key == ord("t") and best is not None:
+                    template_contour = best.copy()
+                    try:
+                        np.save(args.template, template_contour, allow_pickle=False)
+                        print(f"[detect] template captured "
+                              f"({len(template_contour)} points) → {args.template}")
+                    except Exception as e:
+                        print(f"[detect] template save failed: {e}")
+                elif key == ord("c"):
+                    template_contour = None
+                    print("[detect] template cleared — matching disabled")
 
     cap.release()
     cv2.destroyAllWindows()
